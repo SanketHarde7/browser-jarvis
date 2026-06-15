@@ -382,7 +382,7 @@ async def get_response(user_text: str, memory_context: str = "", allow_skills: b
     except asyncio.TimeoutError:
         return {"response": "Taking too long. Try again?", "skill": None}
     except Exception as e:
-        logger.error(f"LLM error: {e}")
+        logger.error(f"LLM error: {e}", exc_info=True)
         return {"response": "Something went wrong. Try again.", "skill": None}
 
 
