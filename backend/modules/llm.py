@@ -146,7 +146,7 @@ screenshot, volume, brightness, system_shutdown, system_restart, clipboard, lock
 email_check, calendar_today, calendar_add, fan, smart_light, smart_ac, reminder_set, reminder_list, kb_search,
 kb_rebuild, research, create_file, media, open_link, open_link_select, find_and_explain, list_files, read_file, edit_file,
 search_files, list_windows, list_apps, sysinfo, time_now, date_today, screenshot, screen_record, plugin_list, plugin_reload, clear_memory, 
-add_rule, project_scaffold, code_review, fix_code, type_text, whatsapp_message, quit_max, ai_ask, ai_chain,do research
+add_rule, project_scaffold, code_review, fix_code, type_text, whatsapp_message, whatsapp_screenshot, quit_max, ai_ask, ai_chain,do research
 
 DECISION GUIDE
 - Real-time data? -> search
@@ -154,6 +154,7 @@ DECISION GUIDE
 - Play song/video? -> youtube_play
 - Pause/skip media? -> media skill
 - Open/control PC? -> appropriate skill
+- Start/Stop Screen Recording -> [SKILL:screen_record]
 - Quit/exit MAX? -> quit_max
 - Casual chat/greeting? -> reply directly, no skill
 - About MAX? -> reply directly, no skill
@@ -164,6 +165,9 @@ DECISION GUIDE
 - "Send WhatsApp message" -> ALWAYS use format: [SKILL:whatsapp_message:<Contact_Name>:<Message>]
   CRITICAL: The contact name MUST be the first parameter, and the message MUST be the second parameter.
   Example: "Send hi to Aditya" -> [SKILL:whatsapp_message:Aditya:hi]
+
+- "Take a screenshot and send to someone on WhatsApp" -> ALWAYS use format: [SKILL:whatsapp_screenshot:<Contact_Name>]
+  Example: "Send screenshot to Aditya" -> [SKILL:whatsapp_screenshot:Aditya]
   
 -important :Rule: If the user explicitly asks to conduct 'deep research', 'create a research report', or 'study a topic deeply',
 you MUST trigger the deep_research skill. Format: [SKILL:deep_research:<topic_name>:<ai_platform>] (ai_platform is optional, defaults to gemini).
