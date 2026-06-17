@@ -46,6 +46,8 @@ def _force_open_app_skill(text: str) -> Optional[str]:
             app_name = m.group(1).strip(" .,!?\"'").strip()
             if app_name and len(app_name) > 1:
                 non_apps = {"it", "this", "that", "them", "me", "us", "him", "her", "something", "anything", "everything", "nothing"}
+                if app_name.lower() in ["screen recording", "recording", "screen record", "screen capture"]:
+                    return "[SKILL:screen_record]"
                 if app_name.lower() not in non_apps:
                     return f"[SKILL:open_app:{app_name}]"
     return None
@@ -63,6 +65,8 @@ class MaxAgent:
         
         # 👻 GHOST MODE INITIALIZED CORRECTLY (NOT COMMENTED OUT)
         self.ghost_mode = False
+        self.typing_mode = False
+
         
         # Real-time reminder scheduler
         try:
@@ -346,72 +350,376 @@ class MaxAgent:
     async def process_ghost_mode_test(self, user_text: str) -> Optional[dict]:
         import pyautogui
         import re
-        from modules.listening_manager import LocalFastBrain
-        pyautogui.FAILSAFE = False 
-        
-        # 🛠️ FIX 1: Punctuation (.,!?) hatao taaki STT ke full-stops se match fail na ho
+        pyautogui.FAILSAFE = False
+
+        # Clean STT artifacts: remove punctuation, lowercase, strip
         text_clean = re.sub(r'[^\w\s]', '', user_text.lower()).strip()
 
-        # 1. Activation Check
-        activation_phrases = ["activate ghost mode", "ghost mode on", "start ghost mode", "enable ghost mode"]
+        # ═══════════════════════════════════════════════════════
+        # 1. DEACTIVATION — MUST be checked BEFORE activation
+        #    ("deactivate ghost mode" contains "activate ghost mode" as substring)
+        # ═══════════════════════════════════════════════════════
+        deactivation_phrases = [
+            "exit ghost mode", "terminate protocol", "ghost mode off",
+            "stop ghost mode", "disable ghost mode", "deactivate ghost mode",
+            "ghost mode band karo", "ghost mode hatao",
+        ]
+        if self.ghost_mode and any(phrase in text_clean for phrase in deactivation_phrases):
+            self.ghost_mode = False
+            self.typing_mode = False
+            logger.info("🚫 Ghost Mode Deactivated")
+            return {"response": "Ghost mode deactivated.", "skill_used": "ghost_deactivate"}
+
+        # ═══════════════════════════════════════════════════════
+        # 2. ACTIVATION
+        # ═══════════════════════════════════════════════════════
+        activation_phrases = [
+            "activate ghost mode", "ghost mode on",
+            "start ghost mode", "enable ghost mode",
+        ]
         if any(phrase in text_clean for phrase in activation_phrases):
             self.ghost_mode = True
-            logger.info("👻 Ghost Mode Activated via Test Protocol")
+            logger.info("👻 Ghost Mode Activated")
             return {"response": "Ghost mode active.", "skill_used": "ghost_activate"}
 
+        # Not in ghost mode → skip entirely
         if not self.ghost_mode:
             return None
 
-        # 2. Deactivation Check
-        deactivation_phrases = ["exit ghost mode", "terminate protocol", "ghost mode off", "stop ghost mode", "disable ghost mode", "deactivate ghost mode"]
-        if any(phrase in text_clean for phrase in deactivation_phrases):
-            self.ghost_mode = False
-            logger.info("🚫 Ghost Mode Deactivated")
-            return {"response": "Exited.", "skill_used": "ghost_deactivate"}
+        # ═══════════════════════════════════════════════════════
+        # TYPING MODE TOGGLES
+        # ═══════════════════════════════════════════════════════
+        if any(cmd in text_clean for cmd in ["start typing", "typing shuru karo", "typing on", "start dictation"]):
+            self.typing_mode = True
+            logger.info("⌨️ Typing Mode Activated")
+            return {"response": "", "skill_used": "typing_start"}
 
-        # 3. Deterministic Command Mapping
+        if any(cmd in text_clean for cmd in ["stop typing", "typing band karo", "typing off", "stop dictation"]):
+            self.typing_mode = False
+            logger.info("🚫 Typing Mode Deactivated")
+            return {"response": "", "skill_used": "typing_stop"}
+
+        # ═══════════════════════════════════════════════════════
+        # SECTION 15 STEP 0: STOP COMMAND (clears vision engine state)
+        # Per plan: check BEFORE anything else in active ghost mode
+        # ═══════════════════════════════════════════════════════
+        stop_phrases = ["stop", "ruk", "band kar", "cancel"]
+        if any(phrase in text_clean for phrase in stop_phrases):
+            if self.vision_engine is not None:
+                self.vision_engine.stop_requested = True
+                self.vision_engine.pending_approval = None
+            return {"response": "Ruk gaya.", "skill_used": "stop"}
+
+        # ═══════════════════════════════════════════════════════
+        # SECTION 15 STEP 0.5: PENDING APPROVAL CHECK
+        # If vision engine is waiting for haan/nahi, route there first
+        # ═══════════════════════════════════════════════════════
+        if self.vision_engine is not None and self.vision_engine.pending_approval is not None:
+            result = await self.vision_engine.vision_click(user_text)
+            return result
+
+        # ═══════════════════════════════════════════════════════
+        # SECTION 15 STEP 1: VISION CLICK TRIGGERS
+        # Check BEFORE existing shortcut matching (per plan Section 15)
+        # ═══════════════════════════════════════════════════════
+
+
+        # ═══════════════════════════════════════════════════════
+        # GHOST MODE IS ACTIVE — FULL HANDS-FREE CONTROL BELOW
+        # ═══════════════════════════════════════════════════════
         try:
-            # 🛠️ FIX 2: Exact match (==) ki jagah Substring match (in) use kiya
-            if any(cmd in text_clean for cmd in ["press enter", "enter maro", "hit enter", "enter daba"]):
-                pyautogui.press('enter')
-                return {"response": "Done.", "skill_used": "key_enter"}
-                
-            elif any(cmd in text_clean for cmd in ["press tab", "tab maro", "tab daba"]):
-                pyautogui.press('tab')
-                return {"response": "Done.", "skill_used": "key_tab"}
-                
-            elif any(cmd in text_clean for cmd in ["press backspace", "backspace", "clear", "undo"]):
-                pyautogui.press('backspace')
-                return {"response": "Done.", "skill_used": "key_backspace"}
+            # ─── HELPER: Release stuck modifiers ──────────────
+            # Prevents bugs where global shortcuts leave Win/Ctrl/Alt stuck,
+            # causing pyautogui.write to trigger OS shortcuts instead of typing text.
+            def _release_modifiers():
+                for mod in ['win', 'ctrl', 'alt', 'shift']:
+                    pyautogui.keyUp(mod)
 
-            elif any(cmd in text_clean for cmd in ["switch window", "window badlo", "alt tab"]):
+            # ─── REPEAT COUNT PARSER ──────────────────────────
+            # Handles: "press enter 10 times", "backspace five times", "3 baar"
+            _WORD_TO_NUM = {
+                "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+                "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+                "eleven": 11, "twelve": 12, "fifteen": 15, "twenty": 20,
+            }
+            def _get_repeat_count(text):
+                # Try digit: "10 times", "5 baar"
+                m = re.search(r'(\d+)\s*(?:times?|baar|bar)', text)
+                if m:
+                    return min(int(m.group(1)), 50)
+                # Try digit standalone at end: "backspace 5"
+                m = re.search(r'(\d+)\s*$', text)
+                if m:
+                    return min(int(m.group(1)), 50)
+                # Try word number: "five times"
+                for word, num in _WORD_TO_NUM.items():
+                    if word in text:
+                        return num
+                return 1
+
+            repeat = _get_repeat_count(text_clean)
+
+            # ─── 3. KEY COMMANDS (silent, hardware-level) ─────
+            # Enter
+            if any(cmd in text_clean for cmd in ["press enter", "enter maro", "hit enter", "enter daba", "enter press karo"]):
+                _release_modifiers()
+                pyautogui.press('enter', presses=repeat, interval=0.02)
+                return {"response": "", "skill_used": "key_enter"}
+
+            # Tab
+            if any(cmd in text_clean for cmd in ["press tab", "tab maro", "tab daba", "tab press karo"]):
+                _release_modifiers()
+                pyautogui.press('tab', presses=repeat, interval=0.02)
+                return {"response": "", "skill_used": "key_tab"}
+
+            # Backspace
+            if any(cmd in text_clean for cmd in ["press backspace", "backspace maro", "backspace daba", "peeche jao", "backspace"]):
+                _release_modifiers()
+                pyautogui.press('backspace', presses=repeat, interval=0.02)
+                return {"response": "", "skill_used": "key_backspace"}
+
+            # Escape
+            if any(cmd in text_clean for cmd in ["press escape", "escape", "escape daba", "cancel karo"]):
+                pyautogui.press('escape')
+                return {"response": "", "skill_used": "key_escape"}
+
+            # Space
+            if any(cmd in text_clean for cmd in ["press space", "space daba", "space maro"]):
+                pyautogui.press('space')
+                return {"response": "", "skill_used": "key_space"}
+
+            # Delete
+            if any(cmd in text_clean for cmd in ["press delete", "delete karo", "delete daba"]):
+                pyautogui.press('delete')
+                return {"response": "", "skill_used": "key_delete"}
+
+            # Arrow keys
+            if any(cmd in text_clean for cmd in ["arrow up", "upar jao", "up arrow"]):
+                pyautogui.press('up')
+                return {"response": "", "skill_used": "key_up"}
+            if any(cmd in text_clean for cmd in ["arrow down", "neeche jao", "down arrow"]):
+                pyautogui.press('down')
+                return {"response": "", "skill_used": "key_down"}
+            if any(cmd in text_clean for cmd in ["arrow left", "left arrow", "baayen jao"]):
+                pyautogui.press('left')
+                return {"response": "", "skill_used": "key_left"}
+            if any(cmd in text_clean for cmd in ["arrow right", "right arrow", "daayen jao"]):
+                pyautogui.press('right')
+                return {"response": "", "skill_used": "key_right"}
+
+            # ─── 4. HOTKEY COMBOS (silent) ────────────────────
+            # Switch window (Alt+Tab)
+            if any(cmd in text_clean for cmd in ["switch window", "window badlo", "alt tab", "dusri window"]):
                 pyautogui.hotkey('alt', 'tab')
-                return {"response": "Done.", "skill_used": "hotkey_alt_tab"}
-                
-            elif any(cmd in text_clean for cmd in ["minimize app", "minimize window", "minimize"]):
+                return {"response": "", "skill_used": "hotkey_alt_tab"}
+
+            # Minimize
+            if any(cmd in text_clean for cmd in ["minimize app", "minimize window", "minimize karo", "minimize"]):
                 pyautogui.hotkey('win', 'down')
-                return {"response": "Done.", "skill_used": "hotkey_minimize"}
+                return {"response": "", "skill_used": "hotkey_minimize"}
 
-            elif any(cmd in text_clean for cmd in ["volume up", "aawaz badhao", "increase volume"]):
+            # Maximize
+            if any(cmd in text_clean for cmd in ["maximize app", "maximize window", "maximize karo", "maximize", "full screen"]):
+                pyautogui.hotkey('win', 'up')
+                return {"response": "", "skill_used": "hotkey_maximize"}
+
+            # Close app (Alt+F4)
+            if any(cmd in text_clean for cmd in ["close app", "close window", "app band karo", "window band karo", "alt f4"]):
+                pyautogui.hotkey('alt', 'F4')
+                return {"response": "", "skill_used": "hotkey_close_app"}
+
+            # Volume
+            if any(cmd in text_clean for cmd in ["volume up", "aawaz badhao", "increase volume", "volume badha"]):
                 pyautogui.press('volumeup')
-                return {"response": "Done.", "skill_used": "volume_up"}
-                
-            elif any(cmd in text_clean for cmd in ["volume down", "aawaz kam karo", "decrease volume"]):
+                return {"response": "", "skill_used": "volume_up"}
+            if any(cmd in text_clean for cmd in ["volume down", "aawaz kam karo", "decrease volume", "volume kam"]):
                 pyautogui.press('volumedown')
-                return {"response": "Done.", "skill_used": "volume_down"}
+                return {"response": "", "skill_used": "volume_down"}
+            if any(cmd in text_clean for cmd in ["mute", "volume mute", "awaaz band karo", "sound off"]):
+                pyautogui.press('volumemute')
+                return {"response": "", "skill_used": "volume_mute"}
 
-            # 4. Fallback: Type the text directly
-            # Yahan hum original user_text use karenge taaki capital letters aur dots type karte waqt sahi rahein
-            # We must strip the wake word (like "max") before typing it!
-            final_type_text = LocalFastBrain.strip_wake_word(user_text)
-            if final_type_text:
-                pyautogui.write(final_type_text + " ", interval=0.01)
-            # Returning empty response prevents MAX from saying "Typed." every single time!
-            return {"response": "", "skill_used": "direct_dictation"}
+            # Browser tab control
+            if any(cmd in text_clean for cmd in ["new tab", "naya tab", "naya tab kholo"]):
+                pyautogui.hotkey('ctrl', 't')
+                return {"response": "", "skill_used": "hotkey_new_tab"}
+            if any(cmd in text_clean for cmd in ["close tab", "tab band karo", "tab close karo"]):
+                pyautogui.hotkey('ctrl', 'w')
+                return {"response": "", "skill_used": "hotkey_close_tab"}
+            if any(cmd in text_clean for cmd in ["next tab", "agla tab", "tab switch karo"]):
+                pyautogui.hotkey('ctrl', 'tab')
+                return {"response": "", "skill_used": "hotkey_next_tab"}
+            if any(cmd in text_clean for cmd in ["previous tab", "pichla tab", "pehle wala tab"]):
+                pyautogui.hotkey('ctrl', 'shift', 'tab')
+                return {"response": "", "skill_used": "hotkey_prev_tab"}
+
+            # Clipboard & Edit shortcuts
+            if any(cmd in text_clean for cmd in ["copy", "copy karo", "ctrl c"]):
+                pyautogui.hotkey('ctrl', 'c')
+                return {"response": "", "skill_used": "hotkey_copy"}
+            if any(cmd in text_clean for cmd in ["paste", "paste karo", "ctrl v", "chipkao"]):
+                pyautogui.hotkey('ctrl', 'v')
+                return {"response": "", "skill_used": "hotkey_paste"}
+            if any(cmd in text_clean for cmd in ["select all", "sab select karo", "ctrl a"]):
+                pyautogui.hotkey('ctrl', 'a')
+                return {"response": "", "skill_used": "hotkey_select_all"}
+            if any(cmd in text_clean for cmd in ["undo karo", "ctrl z", "wapas karo"]):
+                pyautogui.hotkey('ctrl', 'z')
+                return {"response": "", "skill_used": "hotkey_undo"}
+            if any(cmd in text_clean for cmd in ["redo karo", "ctrl y"]):
+                pyautogui.hotkey('ctrl', 'y')
+                return {"response": "", "skill_used": "hotkey_redo"}
+            if any(cmd in text_clean for cmd in ["save karo", "save", "ctrl s", "file save"]):
+                pyautogui.hotkey('ctrl', 's')
+                return {"response": "", "skill_used": "hotkey_save"}
+
+            # Scroll
+            if any(cmd in text_clean for cmd in ["scroll up", "upar scroll", "page up"]):
+                pyautogui.scroll(5)
+                return {"response": "", "skill_used": "scroll_up"}
+            if any(cmd in text_clean for cmd in ["scroll down", "neeche scroll", "page down"]):
+                pyautogui.scroll(-5)
+                return {"response": "", "skill_used": "scroll_down"}
+
+            # ─── 5. 👁️ VISION TRIGGERS ───────────────────────
+            vision_triggers = [
+                "screen pe kya hai", "screen par kya hai", "kya dikh raha hai",
+                "what is on my screen", "whats on my screen", "what do you see",
+                "screen padho", "screen read karo", "read my screen",
+                "ye kya hai", "what is this", "screen dekho", "look at my screen",
+                "screen batao", "tell me whats on screen", "describe my screen",
+                "screen me kya chal raha", "kya open hai", "whats happening on screen",
+                "kya chal raha hai", "check my screen",
+                "see my screen", "can you see my screen", "meri screen dekho",
+            ]
+            if any(trigger in text_clean for trigger in vision_triggers):
+                try:
+                    from modules.context_engine import get_context_engine
+                    ctx = get_context_engine()
+                    result = await ctx.get_full_context(user_query=user_text)
+                    vision_text = result.get("vision_response", "")
+                    if vision_text:
+                        return {"response": vision_text, "skill_used": "ghost_vision"}
+                    else:
+                        return {"response": "Could not read your screen right now.", "skill_used": "ghost_vision_fail"}
+                except Exception as e:
+                    logger.error(f"Ghost Vision failed: {e}")
+                    return {"response": f"Vision error: {e}", "skill_used": "ghost_vision_error"}
+
+            # ─── 6. SKILL COMMANDS (delegate to skills engine) ──
+
+            # 6a. Open app: "open notepad", "chrome kholo", "launch excel"
+            open_match = re.search(
+                r"\b(?:open|khol(?:o|na|do|de)?|launch|start|chalu\s*kar(?:o|do)?)\s+(.+)",
+                text_clean,
+            )
+            if open_match:
+                app_name = open_match.group(1).strip()
+                # Filter out non-app words
+                non_apps = {"it", "this", "that", "them", "me", "something", "anything", "karo", "do"}
+                if app_name and len(app_name) > 1 and app_name not in non_apps:
+                    if app_name.lower() in ["screen recording", "recording", "screen record", "screen capture"]:
+                        skill_tag = "[SKILL:screen_record]"
+                    else:
+                        skill_tag = f"[SKILL:open_app:{app_name}]"
+                    try:
+                        memory_context = self.memory.get_context()
+                        skill_result = await self.skills.parse_and_execute(skill_tag, memory_context, user_text)
+                        if skill_result.get("executed"):
+                            return {"response": "", "skill_used": f"ghost_open:{app_name}"}
+                        else:
+                            error = skill_result.get("error", "")
+                            return {"response": f"Could not open {app_name}. {error}", "skill_used": "ghost_open_fail"}
+                    except Exception as e:
+                        logger.error(f"Ghost open_app failed: {e}")
+                        return {"response": f"Could not open {app_name}.", "skill_used": "ghost_open_fail"}
+
+            # 6b. Play on YouTube: "play lofi music", "ye gaana chalao"
+            play_match = re.search(
+                r"\b(?:play|baja(?:o)?|chala(?:o)?|youtube\s*pe\s*chala(?:o)?)\s+(.+)",
+                text_clean,
+            )
+            if play_match:
+                query = play_match.group(1).strip()
+                # Remove trailing "on youtube" / "youtube pe"
+                query = re.sub(r"\s*(?:on\s+youtube|youtube\s*pe)\s*$", "", query).strip()
+                if query and len(query) > 1:
+                    skill_tag = f"[SKILL:youtube_play:{query}]"
+                    try:
+                        memory_context = self.memory.get_context()
+                        skill_result = await self.skills.parse_and_execute(skill_tag, memory_context, user_text)
+                        if skill_result.get("executed"):
+                            return {"response": "", "skill_used": f"ghost_play:{query}"}
+                    except Exception as e:
+                        logger.error(f"Ghost youtube_play failed: {e}")
+
+            # 6c. Search: "search python tutorials", "google machine learning"
+            search_match = re.search(
+                r"\b(?:search|google|look\s*up|dhoondh(?:o)?|khoj(?:o)?)\s+(.+)",
+                text_clean,
+            )
+            if search_match:
+                query = search_match.group(1).strip()
+                if query and len(query) > 1:
+                    skill_tag = f"[SKILL:search:{query}]"
+                    try:
+                        memory_context = self.memory.get_context()
+                        skill_result = await self.skills.parse_and_execute(skill_tag, memory_context, user_text)
+                        if skill_result.get("executed"):
+                            result_text = skill_result.get("result", "")
+                            return {"response": result_text, "skill_used": f"ghost_search:{query}"}
+                    except Exception as e:
+                        logger.error(f"Ghost search failed: {e}")
+
+            # 6d. Open website: "go to youtube", "github pe jao"
+            web_match = re.search(
+                r"\b(?:go\s*to|visit|navigate\s*to|pe\s*jao|jao)\s+(.+)",
+                text_clean,
+            )
+            if web_match:
+                site = web_match.group(1).strip()
+                if site and len(site) > 1:
+                    skill_tag = f"[SKILL:web_open:{site}]"
+                    try:
+                        memory_context = self.memory.get_context()
+                        skill_result = await self.skills.parse_and_execute(skill_tag, memory_context, user_text)
+                        if skill_result.get("executed"):
+                            return {"response": "", "skill_used": f"ghost_web:{site}"}
+                    except Exception as e:
+                        logger.error(f"Ghost web_open failed: {e}")
+
+            # ─── 7. EXPLICIT DICTATION ("type X" / "likh X") ──
+            type_match = re.search(
+                r"\b(?:type|likh(?:o)?|likho|write)\s+(.+)",
+                text_clean,
+            )
+            if type_match:
+                # Use original text to preserve casing
+                orig_match = re.search(r"(?:type|likh(?:o)?|likho|write)\s+(.+)", user_text, re.IGNORECASE)
+                if orig_match:
+                    type_text = orig_match.group(1).strip()
+                else:
+                    type_text = type_match.group(1).strip()
+                if type_text:
+                    _release_modifiers()
+                    pyautogui.write(type_text + " ", interval=0.01)
+                    return {"response": "", "skill_used": "ghost_dictation"}
+
+            # ─── 8. TYPING MODE FALLBACK OR BLOCK ─────────────
+            if self.typing_mode:
+                from modules.listening_manager import LocalFastBrain
+                final_type_text = LocalFastBrain.strip_wake_word(user_text)
+                if final_type_text:
+                    _release_modifiers()
+                    pyautogui.write(final_type_text + " ", interval=0.01)
+                return {"response": "", "skill_used": "ghost_typing_mode"}
+            else:
+                logger.info(f"👻 Ghost Mode blocked non-command: '{text_clean[:50]}'")
+                return {"response": "I'm in ghost mode right now. Say 'exit ghost mode' to chat with me.", "skill_used": "ghost_blocked"}
 
         except Exception as e:
-            logger.error(f"Ghost Mode hardware execution error: {e}")
-            return {"response": "Error.", "skill_used": "ghost_error"}
+            logger.error(f"Ghost Mode error: {e}")
+            return {"response": "", "skill_used": "ghost_error"}
 
 # Singleton
 _agent: Optional[MaxAgent] = None
