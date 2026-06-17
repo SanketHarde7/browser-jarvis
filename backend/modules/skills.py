@@ -248,6 +248,7 @@ class SkillsEngine:
             "system_shutdown":   self._skill_system_shutdown,
             "system_restart":    self._skill_system_restart,
             "whatsapp_message":  self._skill_whatsapp_message,
+            "whatsapp_screenshot": self._skill_whatsapp_screenshot,
             "type_text":         self._skill_type_text,
             "quit_max":          self._skill_quit_max,  
             "email_send":        self._skill_email_send,
@@ -331,7 +332,7 @@ class SkillsEngine:
         # Deduplicate redundant skills (e.g. open_app:youtube + youtube_play:music)
         filtered_matches = []
         has_youtube_play = any(m.group(1).lower() in ("youtube_play", "youtube_search") for m in matches)
-        has_whatsapp_msg = any(m.group(1).lower() == "whatsapp_message" for m in matches)
+        has_whatsapp_msg = any(m.group(1).lower() in ("whatsapp_message", "whatsapp_screenshot") for m in matches)
         
         for m in matches:
             name = m.group(1).lower()
@@ -343,7 +344,7 @@ class SkillsEngine:
                     logger.info(f"Skipping redundant {name}:{params} because specific youtube skill is active.")
                     continue
                 if has_whatsapp_msg and "whatsapp" in param_lower:
-                    logger.info(f"Skipping redundant {name}:{params} because whatsapp_message skill is active.")
+                    logger.info(f"Skipping redundant {name}:{params} because whatsapp skill is active.")
                     continue
             filtered_matches.append(m)
         
@@ -761,38 +762,38 @@ class SkillsEngine:
         try:
             import ctypes
             import time
-            VK_CONTROL = 0x11
-            VK_SHIFT = 0x10
+            VK_LWIN = 0x5B
+            VK_MENU = 0x12  # Alt
             VK_R = 0x52
             KEYEVENTF_KEYUP = 0x0002
             
             # Press keys
-            ctypes.windll.user32.keybd_event(VK_CONTROL, 0, 0, 0)
-            ctypes.windll.user32.keybd_event(VK_SHIFT, 0, 0, 0)
+            ctypes.windll.user32.keybd_event(VK_LWIN, 0, 0, 0)
+            ctypes.windll.user32.keybd_event(VK_MENU, 0, 0, 0)
             ctypes.windll.user32.keybd_event(VK_R, 0, 0, 0)
             
             time.sleep(0.1)  # Brief pause to let Windows register the hotkey
             
             # Release keys
             ctypes.windll.user32.keybd_event(VK_R, 0, KEYEVENTF_KEYUP, 0)
-            ctypes.windll.user32.keybd_event(VK_SHIFT, 0, KEYEVENTF_KEYUP, 0)
-            ctypes.windll.user32.keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0)
-            return "Screen recording toggled (Ctrl+Shift+R pressed)."
+            ctypes.windll.user32.keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0)
+            ctypes.windll.user32.keybd_event(VK_LWIN, 0, KEYEVENTF_KEYUP, 0)
+            return "Screen recording toggled ."
         except Exception as e_ctypes:
             logger.warning(f"ctypes screen record hotkey failed: {e_ctypes}")
 
         # Method 2: Global keyboard library
         try:
             import keyboard
-            keyboard.send('win+shift+r')
-            return "Screen recording toggled)."
+            keyboard.send('win+alt+r')
+            return "Screen recording toggled ."
         except Exception as e_kb:
             logger.warning(f"keyboard library hotkey failed: {e_kb}")
 
         # Method 3: PyAutoGUI fallback
         if PYAUTOGUI_AVAILABLE:
             try:
-                pyautogui.hotkey('win', 'shift', 'r')
+                pyautogui.hotkey('win', 'alt', 'r')
                 return "Screen recording toggled ."
             except Exception as e_py:
                 return f"All hotkey methods failed. Last error: {e_py}"
@@ -1373,6 +1374,82 @@ class SkillsEngine:
             return f"WhatsApp message successfully sent to {contact_clean.title()}."
         except Exception as e:
             return f"WhatsApp failed: {e}"
+
+    def _skill_whatsapp_screenshot(self, contact: str = "", **kw) -> str:
+        if not PYAUTOGUI_AVAILABLE: 
+            return "Typing needs: pip install pyautogui"
+        if not contact: 
+            return "Provide a contact name or number."
+            
+        contact_clean = contact.strip().lower()
+        is_number = bool(re.match(r'^[\+\d\s\-]+$', contact_clean))
+        
+        if not is_number:
+            contacts_file = Path(self.config.DATA_DIR) / "contacts.json"
+            if contacts_file.exists():
+                try:
+                    contacts_dict = json.loads(contacts_file.read_text(encoding='utf-8'))
+                    resolved_number = contacts_dict.get(contact_clean)
+                    if resolved_number:
+                        contact = resolved_number
+                    else:
+                        return f"Sir, I don't have '{contact.title()}' saved in my contacts."
+                except Exception as e:
+                    logger.error(f"Failed to read contacts JSON: {e}")
+                    return "There is an error in reading the contacts file."
+            else:
+                return "Contacts file missing."
+
+        contact = contact.replace(" ", "").replace("-", "")
+        if not contact.startswith("+"): 
+            contact = "+91" + contact 
+            
+        try:
+            logger.info(f"Taking screenshot for WhatsApp to {contact}...")
+            from PIL import ImageGrab
+            import subprocess
+            ss_dir = Path(self.config.DATA_DIR) / "screenshots"
+            ss_dir.mkdir(parents=True, exist_ok=True)
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            fp = ss_dir / f"whatsapp_ss_{ts}.png"
+            ImageGrab.grab(all_screens=True).save(str(fp))
+            
+            ps_cmd = f"Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.Clipboard]::SetImage([System.Drawing.Image]::FromFile('{str(fp.absolute())}'))"
+            subprocess.run(["powershell", "-command", ps_cmd])
+            
+            import webbrowser
+            url = f"https://web.whatsapp.com/send?phone={contact}"
+            logger.info(f"Opening browser: {url}")
+            webbrowser.open(url)
+            
+            time.sleep(15)
+            
+            try:
+                import pygetwindow as gw
+                windows = [w for w in gw.getAllWindows() if "whatsapp" in w.title.lower()]
+                if not windows:
+                    browser_keywords = ["chrome", "edge", "opera", "firefox", "brave", "browser"]
+                    windows = [w for w in gw.getAllWindows() if any(kw in w.title.lower() for kw in browser_keywords)]
+                if windows:
+                    windows[0].activate()
+                    time.sleep(0.5)
+            except Exception as win_err:
+                pass
+                
+            import pyautogui
+            logger.info("Pasting image...")
+            pyautogui.hotkey("ctrl", "v")
+            time.sleep(2)
+            logger.info("Pressing Enter to send message...")
+            pyautogui.press("enter")
+            
+            time.sleep(5)
+            logger.info("Closing WhatsApp Web tab...")
+            pyautogui.hotkey("ctrl", "w")
+            
+            return f"Screenshot successfully sent to {contact_clean.title()} on WhatsApp."
+        except Exception as e:
+            return f"WhatsApp screenshot failed: {e}"
 
     def _skill_type_text(self, *args) -> str:
         if not PYAUTOGUI_AVAILABLE: 
