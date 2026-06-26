@@ -190,7 +190,9 @@ you MUST trigger the deep_research skill. Format: [SKILL:deep_research:<topic_na
     "Get ChatGPT to write the code and use Gemini to review it" -> [SKILL:ai_chain:chatgpt:gemini:Write and review code for X]
 - ai_ask platforms: chatgpt, gemini, copilot, claude(if listen cloud then trigger claude as a platform), perplexity (use lowercase)
 
-CONTEXT: {memory_context}"""
+PERSONALITY CONTEXT: {personality_context}
+CURRENT EMOTIONAL STATE: {emotion_context}
+MEMORY CONTEXT: {memory_context}"""
 
 
 SYSTEM_PROMPT_CONVERSATION = """You are MAX — a personal AI assistant for a software developer named Sanket.
@@ -225,7 +227,9 @@ MOOD AWARENESS
 - Happy? Match it lightly.
 - Chatty? Engage, ask one question back.
 
-CONTEXT: {memory_context}"""
+PERSONALITY CONTEXT: {personality_context}
+CURRENT EMOTIONAL STATE: {emotion_context}
+MEMORY CONTEXT: {memory_context}"""
 
 
 SKILL_SUMMARY_PROMPT = """You are MAX, Sanket's personal AI assistant. Respond ONLY in English.
@@ -314,35 +318,67 @@ async def get_greeting() -> str:
     return random.choice(GREETINGS_POOL)
 
 
-async def get_response(user_text: str, memory_context: str = "", allow_skills: bool = True) -> dict:
+async def get_response(user_text: str, memory_context: str = "", allow_skills: bool = True, use_history: bool = True) -> dict:
     """
     Main LLM call. Supports multiple skills extraction.
     Increased token limit for better responses.
     """
+    from modules.conversation_store import get_history, add_user_message, add_assistant_message
+    from modules.emotion_tracker import get_current_emotion, update_emotion, get_emotion_prompt_injection
+    from modules.personality_engine import update_topic, increment_message_count, get_personality_injection, get_message_count, get_last_topic, get_time_slot
+
     try:
+        # Update emotion state from current user message before cache check
+        update_emotion(user_text)
+        update_topic(user_text)
+        increment_message_count()
+
         # Short-TTL dedupe cache — rapid duplicate triggers reuse the same result
         # instead of burning another Groq request.
+        _hist_len = str(len(get_history())) if use_history else "0"
         cache_id = make_cache_key(
-            "resp", user_text.strip(), str(allow_skills), (memory_context or "")[:300]
+            "resp", user_text.strip(), str(allow_skills), (memory_context or "")[:300], _hist_len, get_current_emotion(), str(get_message_count()), get_last_topic(), get_time_slot()
         )
         cached = response_cache.get(cache_id)
         if cached is not None:
             logger.info("⚡ Cache hit — skipped one Groq request.")
             return cached
 
+        emotion_injection = get_emotion_prompt_injection()
+        personality_injection = get_personality_injection()
+
         if allow_skills:
-            system_prompt = SYSTEM_PROMPT_SKILLS.replace("{memory_context}", memory_context or "None")
+            system_prompt = (
+                SYSTEM_PROMPT_SKILLS
+                .replace("{memory_context}", memory_context or "None")
+                .replace("{emotion_context}", emotion_injection)
+                .replace("{personality_context}", personality_injection)
+            )
         else:
-            system_prompt = SYSTEM_PROMPT_CONVERSATION.replace("{memory_context}", memory_context or "None")
+            system_prompt = (
+                SYSTEM_PROMPT_CONVERSATION
+                .replace("{memory_context}", memory_context or "None")
+                .replace("{emotion_context}", emotion_injection)
+                .replace("{personality_context}", personality_injection)
+            )
 
         async def call():
             client = await get_client()
+
+            messages_to_send = [{"role": "system", "content": system_prompt}]
+
+            if use_history:
+                history = get_history()
+                # Filter: only add history entries that are NOT the current message
+                for h in history:
+                    if not (h["role"] == "user" and h["content"] == user_text.strip()[:2000]):
+                        messages_to_send.append(h)
+
+            messages_to_send.append({"role": "user", "content": user_text.strip()[:4000]})
+
             return await client.chat.completions.create(
                 model=config.LLM_MODEL,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user",   "content": user_text.strip()[:4000]}  # Reasonable input limit
-                ],
+                messages=messages_to_send,
                 temperature=0.7,
                 max_tokens=400,  # Increased from 200 for better responses
                 stop=["User:", "Sanket:"],  # Prevent continuing as user
@@ -379,10 +415,12 @@ async def get_response(user_text: str, memory_context: str = "", allow_skills: b
                     clean = clean.replace(s, "")
                 clean = re.sub(r' {2,}', ' ', clean).strip()
 
+        if use_history:
+            add_user_message(user_text)
+            add_assistant_message(clean)
+
         result = {"response": clean, "skill": skill_str}
         response_cache.set(cache_id, result)
-        return result
-
     except asyncio.TimeoutError:
         return {"response": "Taking too long. Try again?", "skill": None}
     except Exception as e:
