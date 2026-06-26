@@ -462,6 +462,13 @@ class SkillsEngine:
     
     def _skill_quit_max(self, *args) -> str:
         """Sends hibernate signal to frontend. Rust will handle the actual kill."""
+        from modules.conversation_store import clear_history
+        from modules.emotion_tracker import reset_emotion
+        from modules.personality_engine import reset_message_count, reset_topic
+        clear_history()
+        reset_emotion()
+        reset_message_count()
+        reset_topic()
         logger.info("Sending HIBERNATE signal. Handing over kill authority to Rust Tauri.")
         return "[ACTION:HIBERNATE] I am going to sleep now. Just click my tray icon if you need me!"
 
@@ -635,6 +642,13 @@ class SkillsEngine:
         return "YouTube search opened."
 
     def _skill_clear_memory(self) -> str:
+        from modules.conversation_store import clear_history
+        from modules.emotion_tracker import reset_emotion
+        from modules.personality_engine import reset_message_count, reset_topic
+        clear_history()
+        reset_emotion()
+        reset_message_count()
+        reset_topic()
         return "Memory cleared."
 
     def _skill_add_rule(self, *args) -> str:
