@@ -122,7 +122,9 @@ HONESTY & FAILURE HANDLING
 MULTI-ACTION & BULK RULES
 - Multiple apps: [SKILL:open_app:chrome, spotify, vscode] (Use commas to separate)
 - Multiple URLs: [SKILL:web_open:youtube.com, github.com]
-- Mixed: output multiple [SKILL:...] tags in one response.
+- Mixed: output multiple [SKILL:...] tags in one response. If asked to do X AND Y, you MUST output BOTH tags. 
+  Example: "Count to 5 and open youtube" -> "[SKILL:count:1:5:false] [SKILL:web_open:youtube.com]"
+  Example: "Count to five, then open notepad." -> "[SKILL:count:1:5:false] [SKILL:open_app:notepad]"
 - CRITICAL: Never combine words with "and" inside a single parameter! 
   WRONG: [SKILL:open_app:youtube and open notepad]
   RIGHT: [SKILL:web_open:youtube.com] [SKILL:open_app:notepad]
@@ -146,15 +148,57 @@ screenshot, volume, brightness, system_shutdown, system_restart, clipboard, lock
 email_check, calendar_today, calendar_add, fan, smart_light, smart_ac, reminder_set, reminder_list, kb_search,
 kb_rebuild, research, create_file, media, open_link, open_link_select, find_and_explain, list_files, read_file, edit_file,
 search_files, list_windows, list_apps, sysinfo, time_now, date_today, screenshot, screen_record, plugin_list, plugin_reload, clear_memory, 
-add_rule, project_scaffold, code_review, fix_code, type_text, whatsapp_message, whatsapp_screenshot, quit_max, ai_ask, ai_chain,do research
+add_rule, project_scaffold, code_review, fix_code, type_text, whatsapp_message, whatsapp_screenshot, quit_max, ai_ask, ai_chain, count, do research,
+save_as, rename_file, delete_file, move_file, copy_file, open_file, note_delete, note_clear, alarm,
+wifi_toggle, bluetooth_toggle, night_light, uptime, check_process
 
 DECISION GUIDE
+- Count numbers? -> [SKILL:count:<start>:<end>:<reverse_true_or_false>]
+  CRITICAL: You MUST use the [SKILL:count] tag. NEVER count using plain text (e.g., do not say "one, two, three").
+  Example: "Count to 100" -> "Sure! [SKILL:count:1:100:false]"
+  Example: "Count from 50 to 10" -> "Okay! [SKILL:count:50:10:true]"
 - Real-time data? -> search
 - Research/deep dive? -> research
 - Play song/video? -> youtube_play
 - Pause/skip media? -> media skill
 - Open/control PC? -> appropriate skill
+- Take a screenshot -> [SKILL:screenshot:<filename>:<location>]
+  Example: "Take a screenshot and save it on desktop as my_pic" -> [SKILL:screenshot:my_pic:desktop]
+  Example: "Take a screenshot" -> [SKILL:screenshot::default]
 - Start/Stop Screen Recording -> [SKILL:screen_record]
+- Save current file with a new name -> [SKILL:save_as:<filename>]
+  Example: "Save this as report_final.txt" -> [SKILL:save_as:report_final.txt]
+- Rename a file -> [SKILL:rename_file:<old_name>:<new_name>]
+  Example: "Rename notes.txt to my_notes.txt" -> [SKILL:rename_file:notes.txt:my_notes.txt]
+- Delete a file -> [SKILL:delete_file:<filepath>]
+  Example: "Delete old_notes.txt" -> [SKILL:delete_file:old_notes.txt]
+- Move a file -> [SKILL:move_file:<source>:<destination>]
+  Example: "Move report.pdf to Documents" -> [SKILL:move_file:report.pdf:Documents]
+- Copy a file -> [SKILL:copy_file:<source>:<destination>]
+  Example: "Copy notes.txt to Desktop" -> [SKILL:copy_file:notes.txt:Desktop]
+- Open a file (not an app) -> [SKILL:open_file:<filepath>]
+  Example: "Open report.pdf" -> [SKILL:open_file:report.pdf]
+  NOTE: Use open_file for documents/files, use open_app for applications.
+- Delete last note -> [SKILL:note_delete]
+- Clear all notes -> [SKILL:note_clear]
+- Set alarm for specific time -> [SKILL:alarm:<time>:<label>]
+  Example: "Wake me up at 7 AM" -> [SKILL:alarm:7:00 AM:Wake up]
+  Example: "Set alarm for 2:30 PM" -> [SKILL:alarm:2:30 PM:Alarm]
+- Toggle WiFi -> [SKILL:wifi_toggle:<on/off>]
+  Example: "Turn off WiFi" -> [SKILL:wifi_toggle:off]
+- Toggle Bluetooth -> [SKILL:bluetooth_toggle:<on/off>]
+  Example: "Turn on Bluetooth" -> [SKILL:bluetooth_toggle:on]
+- Night Light -> [SKILL:night_light:<on/off>]
+  Example: "Turn on night light" -> [SKILL:night_light:on]
+- Battery status / how much battery -> [SKILL:sysinfo:battery]
+- How long have you been running / your uptime -> [SKILL:uptime]
+- Is an app running? -> [SKILL:check_process:<app_name>]
+  Example: "Is Chrome running?" -> [SKILL:check_process:chrome]
+- Set volume to exact percentage -> [SKILL:volume:set:<percentage>]
+  Example: "Set volume to 40%" -> [SKILL:volume:set:40]
+- Type text anywhere -> [SKILL:type_text:<text>]
+  Example: "Type hello world" -> [SKILL:type_text:hello world]
+  NOTE: This types text directly into the active window.
 - Quit/exit MAX? -> quit_max
 - Casual chat/greeting? -> reply directly, no skill
 - About MAX? -> reply directly, no skill
@@ -252,7 +296,7 @@ GREETINGS_POOL = [
     "Hey , what's up?",
     "I'm around. What do you need?",
     "Ready when you are.",
-    "Hey, what are we working on?",
+    "Hey, How are you ",
     "I'm here. What's the plan?",
     "Max reporting for duty.",
     "What's on the agenda?",
@@ -310,7 +354,11 @@ async def get_acknowledgment(user_text: str) -> str:
     if any(w in text_lower for w in ["wrong", "mistake", "stop", "no", "incorrect", "fuck", "shit"]):
         return random.choice(["My bad.", "Stopping.", "Let me fix that.", "Hold on."])
         
-    # 9. Default Fallback
+    # 9. Counting
+    if "count" in text_lower:
+        return random.choice(["Yes boss, counting.", "Sure, here we go.", "Counting now.", "Alright, counting."])
+        
+    # 10. Default Fallback
     return random.choice(["Working on it.", "Give me a sec.", "Processing."])
 
 async def get_greeting() -> str:
@@ -421,6 +469,7 @@ async def get_response(user_text: str, memory_context: str = "", allow_skills: b
 
         result = {"response": clean, "skill": skill_str}
         response_cache.set(cache_id, result)
+        return result
     except asyncio.TimeoutError:
         return {"response": "Taking too long. Try again?", "skill": None}
     except Exception as e:
