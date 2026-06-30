@@ -49,7 +49,8 @@ DATA_SKILLS = {
     "kb_search", "kb_list", "kb_stats", "kb_rebuild",
     "ai_ask", "ai_ask_screen", "ai_ask_file", "ai_ask_clipboard",
     "ai_compare", "ai_chain", "ai_route", "ai_workflow",
-    "ai_workflow_save", "ai_workflow_list"
+    "ai_workflow_save", "ai_workflow_list",
+    "check_process", "uptime"
 }
 
 LONG_RESULT_SKILLS = {
@@ -197,6 +198,38 @@ class SkillsEngine:
             self._app_indexer = get_app_indexer(self.config)
         return self._app_indexer
 
+    def _resolve_user_path(self, path_str: str) -> Path:
+        """Resolve keywords like 'desktop', 'documents', 'downloads' to absolute paths."""
+        if not path_str:
+            return None
+        p_clean = path_str.strip()
+        p_lower = p_clean.lower()
+        home = Path.home()
+        onedrive = home / "OneDrive"
+        
+        # Helper to get the correct base path for a special folder
+        def get_base_path(folder: str) -> Path:
+            if folder in ["desktop", "documents", "pictures"]:
+                # Check if OneDrive has hijacked the folder
+                if (onedrive / folder.title()).exists():
+                    return onedrive / folder.title()
+            return home / folder.title()
+
+        special_folders = ["desktop", "documents", "downloads", "pictures", "music", "videos"]
+        
+        # Exact match
+        if p_lower in special_folders:
+            return get_base_path(p_lower)
+            
+        # Prefix match (e.g., "desktop/my_folder")
+        for folder in special_folders:
+            if p_lower.startswith(f"{folder}/") or p_lower.startswith(f"{folder}\\"):
+                sub_path = p_clean[len(folder)+1:]
+                return get_base_path(folder) / sub_path
+                
+        # Return path object
+        return Path(p_clean).expanduser()
+
     def _load_plugins(self):
         try:
             self.plugin_loader.load_all()
@@ -207,7 +240,10 @@ class SkillsEngine:
         base = {
             "weather":           self._skill_weather,
             "timer":             self._skill_timer,
+            "alarm":             self._skill_alarm,
             "note":              self._skill_note,
+            "note_delete":       self._skill_note_delete,
+            "note_clear":        self._skill_note_clear,
             "search":            self._skill_web_search,
             "youtube_search":    self._skill_youtube_search,
             "youtube_play":      self._skill_youtube_play,
@@ -275,6 +311,20 @@ class SkillsEngine:
             # ── AI Orchestrator skills ──────────────────────────────────────
             "ai_ask":            self._skill_ai_ask,
             "ai_chain":          self._skill_ai_chain,
+            "count":             self._skill_count,
+            # ── File Operations ────────────────────────────────────────────
+            "save_as":           self._skill_save_as,
+            "rename_file":       self._skill_rename_file,
+            "delete_file":       self._skill_delete_file,
+            "move_file":         self._skill_move_file,
+            "copy_file":         self._skill_copy_file,
+            "open_file":         self._skill_open_file,
+            # ── System Toggles ─────────────────────────────────────────────
+            "wifi_toggle":       self._skill_wifi_toggle,
+            "bluetooth_toggle":  self._skill_bluetooth_toggle,
+            "night_light":       self._skill_night_light,
+            "uptime":            self._skill_uptime,
+            "check_process":     self._skill_check_process,
         }
         try:
             pl = self.plugin_loader
@@ -360,14 +410,14 @@ class SkillsEngine:
 
         clean_text = re.sub(r' {2,}', ' ', self.SKILL_PATTERN.sub("", response_text)).strip()
 
-        # ── Parallel execution for launch-type skills ──────────────────────
-        # open_app / web_open just fire os.startfile or webbrowser — safe to
-        # run concurrently. Every other skill runs sequentially as before.
+        # ── Execution Strategy ──
+        # If 'count' is in the requested skills, we force strict sequential execution
+        # to respect the blocking timer nature of count. Otherwise, we run safe skills
+        # (like open_app) in parallel for speed.
+        has_count = any(m.group(1).lower() == "count" for m in matches)
+        
         PARALLEL_SKILLS = {"open_app", "web_open"}
-
-        parallel_matches = [m for m in matches if m.group(1).lower() in PARALLEL_SKILLS]
-        serial_matches   = [m for m in matches if m.group(1).lower() not in PARALLEL_SKILLS]
-
+        
         async def _run_single_match(match):
             skill_name = match.group(1).lower()
             params_str  = match.group(2) or ""
@@ -379,7 +429,7 @@ class SkillsEngine:
                     from modules.skill_forge import get_skill_forge
                     get_skill_forge(self.config).record_unknown_skill(skill_name, user_request)
                 except Exception as e:
-                    logger.error(f"Failed to record unknown skill in SkillForge: {e}")
+                    logger.error(f"Failed to record unknown skill: {e}")
                 return None, skill_name, False
 
             try:
@@ -388,7 +438,6 @@ class SkillsEngine:
                 if asyncio.iscoroutinefunction(func):
                     result = await func(*params)
                 else:
-                    # Run sync skill in a separate thread to keep the event loop non-blocking
                     result = await asyncio.to_thread(func, *params)
                 return str(result) if result else "", skill_name, skill_name in DATA_SKILLS
             except Exception as e:
@@ -396,52 +445,53 @@ class SkillsEngine:
                 logger.error(f"Skill '{skill_name}' failed: {e}\n{traceback.format_exc()}")
                 return f"Error executing {skill_name}: {e}", skill_name, False
 
-        # Run all open/web skills at the same time
-        if parallel_matches:
-            parallel_results = await asyncio.gather(
-                *[_run_single_match(m) for m in parallel_matches]
-            )
-            for res_str, sname, is_d in parallel_results:
-                if res_str is not None:
-                    results.append(res_str)
-                    tts_results.append(_truncate_for_tts(res_str, sname))
-                    executed_any = True
-                    if is_d:
-                        is_data = True
-
-        # Run everything else serially (data/AI skills have side-effects)
-        for match in serial_matches:
-            skill_name = match.group(1).lower()
-            params_str  = match.group(2) or ""
-            params = self._parse_parameters(skill_name, params_str)
-
-            if skill_name not in self.skills_registry:
-                logger.warning(f"Unknown skill: {skill_name}")
-                try:
-                    from modules.skill_forge import get_skill_forge
-                    get_skill_forge(self.config).record_unknown_skill(skill_name, user_request)
-                except Exception as e:
-                    logger.error(f"Failed to record unknown skill in SkillForge: {e}")
-                continue
-
-            try:
-                logger.info(f"⚙️  Executing {skill_name}({params})")
-                func = self.skills_registry[skill_name]
-                if asyncio.iscoroutinefunction(func):
-                    result = await func(*params)
-                else:
-                    # Run sync skill in a separate thread to keep the event loop non-blocking
-                    result = await asyncio.to_thread(func, *params)
-                result_str = str(result) if result else ""
-                results.append(result_str)
-                tts_results.append(_truncate_for_tts(result_str, skill_name))
+        def _handle_match_result(res_str, sname, is_d):
+            nonlocal executed_any, is_data
+            if res_str is not None:
+                results.append(res_str)
+                tts_results.append(_truncate_for_tts(res_str, sname))
                 executed_any = True
-                if skill_name in DATA_SKILLS:
+                if is_d:
                     is_data = True
-            except Exception as e:
-                import traceback
-                logger.error(f"Skill '{skill_name}' failed: {e}\n{traceback.format_exc()}")
-                results.append(f"Error executing {skill_name}: {e}")
+
+        if has_count:
+            # STRICT SEQUENTIAL MODE
+            from agent_core import get_active_websocket
+            from modules.tts import generate_tts
+            import base64
+            import os
+            
+            for i, match in enumerate(matches):
+                res_str, sname, is_d = await _run_single_match(match)
+                _handle_match_result(res_str, sname, is_d)
+                
+                # If we just finished counting and there are more skills to execute, play a transition audio
+                ws = get_active_websocket()
+                if sname == "count" and i < len(matches) - 1 and ws:
+                    try:
+                        next_skill = matches[i+1].group(1).lower()
+                        trans_text = f"Counting is done, executing {next_skill.replace('_', ' ')}"
+                        trans_wav = await generate_tts(trans_text)
+                        if trans_wav and os.path.exists(trans_wav):
+                            with open(trans_wav, "rb") as f:
+                                b64 = base64.b64encode(f.read()).decode('utf-8')
+                                await ws.send_json({"event": "audio_response", "audio": b64})
+                            os.remove(trans_wav)
+                    except Exception as e:
+                        logger.error(f"Transition TTS failed: {e}")
+        else:
+            # FAST PARALLEL MODE (Default)
+            parallel_matches = [m for m in matches if m.group(1).lower() in PARALLEL_SKILLS]
+            serial_matches   = [m for m in matches if m.group(1).lower() not in PARALLEL_SKILLS]
+            
+            if parallel_matches:
+                parallel_results = await asyncio.gather(*[_run_single_match(m) for m in parallel_matches])
+                for res_str, sname, is_d in parallel_results:
+                    _handle_match_result(res_str, sname, is_d)
+                    
+            for match in serial_matches:
+                res_str, sname, is_d = await _run_single_match(match)
+                _handle_match_result(res_str, sname, is_d)
 
         if not executed_any:
             return {"executed": False, "clean_text": clean_text, "is_data_skill": False}
@@ -550,6 +600,27 @@ class SkillsEngine:
 
     async def _skill_search_files(self, *args):     
         return await asyncio.to_thread(self.file_manager.search_files, *args)
+
+    def _skill_count(self, start: str, end: str, reverse: str = "False") -> str:
+        try:
+            start_num = int(start.strip())
+            end_num = int(end.strip())
+            is_reverse = str(reverse).strip().lower() in ['true', 'yes', '1']
+            
+            if is_reverse or start_num > end_num:
+                step = -1
+                if start_num < end_num:
+                    start_num, end_num = end_num, start_num
+            else:
+                step = 1
+                
+            if abs(end_num - start_num) > 1000:
+                return "That's too many numbers for me to count."
+                
+            numbers = [str(i) for i in range(start_num, end_num + step, step)]
+            return ", ".join(numbers)
+        except ValueError:
+            return "Please provide valid numbers to count."
 
     def _skill_weather(self, city: str = "auto") -> str:
         try:
@@ -691,6 +762,51 @@ class SkillsEngine:
         except ValueError:
             return "Provide duration in seconds."
 
+    def _skill_alarm(self, time_str: str = "", label: str = "Alarm", *args) -> str:
+        """Set an alarm for a specific time (e.g., 7:00 AM, 14:30)."""
+        if not time_str:
+            return "What time should I set the alarm for?"
+        try:
+            from datetime import timedelta
+            now = datetime.now()
+            time_str_clean = time_str.strip().upper().replace('.', ':')
+            # Parse time formats: "7:00 AM", "7AM", "14:30", "7:00"
+            parsed_time = None
+            for fmt in ["%I:%M %p", "%I:%M%p", "%I %p", "%I%p", "%H:%M", "%H"]:
+                try:
+                    parsed_time = datetime.strptime(time_str_clean, fmt).time()
+                    break
+                except ValueError:
+                    continue
+            if parsed_time is None:
+                return f"Could not understand time format: {time_str}. Try '7:00 AM' or '14:30'."
+            target = now.replace(hour=parsed_time.hour, minute=parsed_time.minute, second=0, microsecond=0)
+            if target <= now:
+                target += timedelta(days=1)  # Set for tomorrow if time already passed
+            delta_secs = int((target - now).total_seconds())
+            full_label = (label + " " + " ".join(args)).strip() if args else label
+
+            def _alarm_ring():
+                time.sleep(delta_secs)
+                msg = f"MAX: {full_label}! It's {target.strftime('%I:%M %p')}."
+                try:
+                    from plyer import notification
+                    notification.notify(title="MAX Alarm", message=msg, timeout=10)
+                    return
+                except ImportError:
+                    pass
+                if platform.system() == "Windows":
+                    subprocess.run([
+                        "powershell", "-Command",
+                        f"Add-Type -AssemblyName System.Windows.Forms; "
+                        f"[System.Windows.Forms.MessageBox]::Show('{msg}','MAX Alarm')"
+                    ], capture_output=True)
+
+            threading.Thread(target=_alarm_ring, daemon=True).start()
+            return f"Alarm set for {target.strftime('%I:%M %p')} ({delta_secs // 60} minutes from now)."
+        except Exception as e:
+            return f"Alarm failed: {e}"
+
     def _skill_note(self, *args) -> str:
         try:
             text = " ".join(args).strip()
@@ -704,6 +820,33 @@ class SkillsEngine:
             return "Note saved."
         except Exception as e:
             return f"Note save failed: {e}"
+
+    def _skill_note_delete(self, *args) -> str:
+        """Delete the last note from notes.txt."""
+        try:
+            notes_file = Path(self.config.DATA_DIR) / "notes.txt"
+            if not notes_file.exists():
+                return "No notes file found."
+            lines = notes_file.read_text(encoding='utf-8').strip().split('\n')
+            lines = [l for l in lines if l.strip()]
+            if not lines:
+                return "Notes are already empty."
+            removed = lines.pop()
+            notes_file.write_text('\n'.join(lines) + ('\n' if lines else ''), encoding='utf-8')
+            return f"Last note deleted: {removed[:80]}"
+        except Exception as e:
+            return f"Note delete failed: {e}"
+
+    def _skill_note_clear(self, *args) -> str:
+        """Clear all notes."""
+        try:
+            notes_file = Path(self.config.DATA_DIR) / "notes.txt"
+            if not notes_file.exists():
+                return "No notes file found."
+            notes_file.write_text('', encoding='utf-8')
+            return "All notes cleared."
+        except Exception as e:
+            return f"Note clear failed: {e}"
 
     async def _skill_read_screen(self, *args) -> str:
         target = " ".join(args).strip()
@@ -759,15 +902,28 @@ class SkillsEngine:
         except ImportError:
             return "pygetwindow needed"
 
-    async def _skill_screenshot(self, filename: str = "", **kw) -> str:
+    async def _skill_screenshot(self, filename: str = "", location: str = "default", **kw) -> str:
         try:
             from PIL import ImageGrab
-            sd = Path(self.config.DATA_DIR) / "screenshots"
+            
+            # Resolve destination
+            loc_clean = location.strip().lower()
+            if loc_clean in ["", "default"]:
+                sd = Path(self.config.DATA_DIR) / "screenshots"
+            else:
+                sd = self._resolve_user_path(loc_clean)
+                if not sd.is_absolute():
+                    sd = Path(self.config.DATA_DIR) / "screenshots"
             sd.mkdir(parents=True, exist_ok=True)
+            
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            fp = sd / f"{filename.strip() or 'max_screenshot'}_{ts}.png"
+            fname = filename.strip() or 'max_screenshot'
+            if not fname.lower().endswith(".png"):
+                fname += f"_{ts}.png"
+                
+            fp = sd / fname
             await asyncio.to_thread(pyautogui.screenshot, str(fp))
-            return f"Screenshot saved: {fp.name}"
+            return f"Screenshot saved at {fp}"
         except Exception as e:
             return f"Screenshot failed: {e}"
 
@@ -1766,10 +1922,18 @@ Rules:
             response = await execute_with_retry(call)
             content = response.choices[0].message.content.strip()
 
-            # Save to CODE_SAVE_DIR (where MAX saves generated files)
-            save_dir = self.config.CODE_SAVE_DIR
-            save_dir.mkdir(parents=True, exist_ok=True)
-            file_path = save_dir / filename
+            # Check if filename includes a directory path to resolve
+            resolved_path = self._resolve_user_path(filename)
+            if resolved_path and resolved_path.parent != Path.home(): 
+                # Meaning it resolved to a specific folder like Desktop
+                file_path = resolved_path
+                save_dir = file_path.parent
+                save_dir.mkdir(parents=True, exist_ok=True)
+            else:
+                # Save to CODE_SAVE_DIR (where MAX saves generated files)
+                save_dir = self.config.CODE_SAVE_DIR
+                save_dir.mkdir(parents=True, exist_ok=True)
+                file_path = save_dir / filename
 
             # Avoid overwriting existing files
             if file_path.exists():
@@ -1794,6 +1958,381 @@ Rules:
             logger.error(f"create_file error: {e}")
             return f"File create karne mein error aaya: {str(e)}"
 
+
+    async def _skill_count(self, start: str, end: str, reverse: str = "False") -> str:
+        """Count numbers from start to end with natural pauses and stream via WebSocket."""
+        print(f"🔢 [COUNT DEBUG] _skill_count called: start={start}, end={end}, reverse={reverse}")
+        try:
+            start_num = int(start.strip())
+            end_num = int(end.strip())
+            is_reverse = str(reverse).strip().lower() in ['true', 'yes', '1']
+            
+            if is_reverse or start_num > end_num:
+                step = -1
+                if start_num < end_num:
+                    start_num, end_num = end_num, start_num
+            else:
+                step = 1
+                
+            if abs(end_num - start_num) > 1000:
+                return "That's too many numbers for me to count."
+                
+            numbers = list(range(start_num, end_num + step, step))
+            print(f"🔢 [COUNT DEBUG] Numbers to count: {numbers}")
+            
+            try:
+                from agent_core import get_active_websocket
+                from modules.tts import generate_tts
+                import base64
+                import os
+                
+                ws = get_active_websocket()
+                print(f"🔢 [COUNT DEBUG] WebSocket available: {ws is not None}")
+                if not ws:
+                    print("🔴 [COUNT DEBUG] WebSocket is None! Cannot stream audio.")
+                    return ""
+                
+                for num in numbers:
+                    # Check for interruption
+                    from agent_core import _agent_instance
+                    if _agent_instance and not _agent_instance.listening_manager.continuous_mode:
+                        logger.info("Counting interrupted by user stop command.")
+                        break
+                        
+                    num_word = _number_to_words(num)
+                    print(f"🔢 [COUNT DEBUG] Generating TTS for: {num_word}")
+                    tts_path = await generate_tts(f"{num_word}.")
+                    print(f"🔢 [COUNT DEBUG] TTS path: {tts_path}")
+                    
+                    if tts_path and os.path.exists(tts_path):
+                        with open(tts_path, "rb") as f:
+                            encoded_audio = base64.b64encode(f.read()).decode('utf-8')
+                            await ws.send_json({"event": "audio_response", "audio": encoded_audio})
+                        print(f"🔢 [COUNT DEBUG] Sent audio for number {num}")
+                        try:
+                            os.remove(tts_path)
+                        except Exception:
+                            pass
+                    
+                    await asyncio.sleep(self.config.COUNTING_PAUSE)
+                
+                print("🔢 [COUNT DEBUG] Counting loop complete!")
+                return ""
+            except Exception as e:
+                import traceback
+                print(f"🔴 [COUNT DEBUG] Stream count EXCEPTION: {e}")
+                logger.error(f"Stream count failed: {e}\n{traceback.format_exc()}")
+                return ""
+            
+        except ValueError as ve:
+            print(f"🔴 [COUNT DEBUG] ValueError: {ve}")
+            return "Please provide valid numbers to count."
+
+    # ════════════════════════════════════════════
+    # FILE OPERATIONS SKILLS
+    # ════════════════════════════════════════════
+
+    def _skill_save_as(self, filename: str = "", *args) -> str:
+        """Save the current file with a new name using Ctrl+Shift+S dialog."""
+        if not PYAUTOGUI_AVAILABLE:
+            return "Save As needs: pip install pyautogui"
+        full_name = (filename + " " + " ".join(args)).strip() if args else filename.strip()
+        if not full_name:
+            return "What filename should I save as?"
+        try:
+            # Check if there is a slash, meaning it contains a directory
+            if "/" in full_name or "\\" in full_name:
+                resolved_path = self._resolve_user_path(full_name)
+                # Ensure it's returned as a string for PyAutoGUI
+                typing_str = str(resolved_path) if resolved_path else full_name
+            else:
+                typing_str = full_name
+
+            pyautogui.hotkey('ctrl', 'shift', 's')
+            time.sleep(1.5)  # Wait for Save As dialog to open
+            # Clear existing filename field and type new name
+            pyautogui.hotkey('ctrl', 'a')
+            time.sleep(0.2)
+            pyautogui.typewrite(typing_str, interval=0.03)
+            time.sleep(0.3)
+            pyautogui.press('enter')
+            return f"File saved as '{typing_str}'."
+        except Exception as e:
+            return f"Save As failed: {e}"
+
+    def _skill_rename_file(self, old_name: str = "", new_name: str = "", *args) -> str:
+        """Rename a file or folder."""
+        if not old_name:
+            return "Which file should I rename?"
+        if not new_name:
+            return "What should the new name be?"
+        try:
+            old_path = Path(old_name.strip()).expanduser().resolve()
+            if not old_path.is_absolute():
+                for d in self.file_manager.search_dirs:
+                    candidate = d / old_name.strip()
+                    if candidate.exists():
+                        old_path = candidate
+                        break
+            if not old_path.exists():
+                return f"File not found: {old_name}"
+            new_path = old_path.parent / new_name.strip()
+            if new_path.exists():
+                return f"A file named '{new_name}' already exists in that folder."
+            old_path.rename(new_path)
+            return f"Renamed '{old_path.name}' to '{new_name.strip()}'."
+        except Exception as e:
+            return f"Rename failed: {e}"
+
+    def _skill_delete_file(self, filepath: str = "", *args) -> str:
+        """Delete a file (sends to recycle bin if possible)."""
+        full_path_str = (filepath + " " + " ".join(args)).strip() if args else filepath.strip()
+        if not full_path_str:
+            return "Which file should I delete?"
+        try:
+            path = Path(full_path_str).expanduser().resolve()
+            if not path.is_absolute():
+                for d in self.file_manager.search_dirs:
+                    candidate = d / full_path_str
+                    if candidate.exists():
+                        path = candidate
+                        break
+            if not path.exists():
+                return f"File not found: {full_path_str}"
+            name = path.name
+            try:
+                from send2trash import send2trash
+                send2trash(str(path))
+                return f"'{name}' moved to Recycle Bin."
+            except ImportError:
+                path.unlink()
+                return f"'{name}' deleted permanently (send2trash not installed for Recycle Bin)."
+        except Exception as e:
+            return f"Delete failed: {e}"
+
+    def _skill_move_file(self, source: str = "", destination: str = "", *args) -> str:
+        """Move a file or folder to a new location."""
+        import shutil
+        if not source:
+            return "Which file should I move?"
+        if not destination:
+            return "Where should I move it to?"
+        try:
+            src = Path(source.strip()).expanduser().resolve()
+            if not src.is_absolute():
+                for d in self.file_manager.search_dirs:
+                    candidate = d / source.strip()
+                    if candidate.exists():
+                        src = candidate
+                        break
+            if not src.exists():
+                return f"Source not found: {source}"
+            
+            # Resolve destination
+            dst_str = destination.strip()
+            resolved_dst = self._resolve_user_path(dst_str)
+            if resolved_dst:
+                dst = resolved_dst
+            else:
+                dst = Path(dst_str).expanduser().resolve()
+                if not dst.is_absolute():
+                    dst = self.file_manager.search_dirs[0] / dst_str
+
+            if dst.is_dir():
+                dst = dst / src.name
+            shutil.move(str(src), str(dst))
+            return f"Moved '{src.name}' to '{dst.parent.name}/{dst.name}'."
+        except Exception as e:
+            return f"Move failed: {e}"
+
+    def _skill_copy_file(self, source: str = "", destination: str = "", *args) -> str:
+        """Copy a file to a new location."""
+        import shutil
+        if not source:
+            return "Which file should I copy?"
+        if not destination:
+            return "Where should I copy it to?"
+        try:
+            src = Path(source.strip()).expanduser().resolve()
+            if not src.is_absolute():
+                for d in self.file_manager.search_dirs:
+                    candidate = d / source.strip()
+                    if candidate.exists():
+                        src = candidate
+                        break
+            if not src.exists():
+                return f"Source not found: {source}"
+
+            # Resolve destination
+            dst_str = destination.strip()
+            resolved_dst = self._resolve_user_path(dst_str)
+            if resolved_dst:
+                dst = resolved_dst
+            else:
+                dst = Path(dst_str).expanduser().resolve()
+                if not dst.is_absolute():
+                    dst = self.file_manager.search_dirs[0] / dst_str
+
+            if dst.is_dir():
+                dst = dst / src.name
+            if src.is_dir():
+                shutil.copytree(str(src), str(dst))
+            else:
+                shutil.copy2(str(src), str(dst))
+            return f"Copied '{src.name}' to '{dst.parent.name}/{dst.name}'."
+        except Exception as e:
+            return f"Copy failed: {e}"
+
+    # ════════════════════════════════════════════
+    # OPEN FILE SKILL (opens file with default OS app)
+    # ════════════════════════════════════════════
+
+    def _skill_open_file(self, filepath: str = "", *args) -> str:
+        """Open a file with its default OS application."""
+        full_path_str = (filepath + " " + " ".join(args)).strip() if args else filepath.strip()
+        if not full_path_str:
+            return "Which file should I open?"
+        try:
+            path = Path(full_path_str).expanduser().resolve()
+            if not path.is_absolute():
+                for d in self.file_manager.search_dirs:
+                    candidate = d / full_path_str
+                    if candidate.exists():
+                        path = candidate
+                        break
+            if not path.exists():
+                return f"File not found: {full_path_str}"
+            os.startfile(str(path))
+            return f"Opened '{path.name}'."
+        except AttributeError:
+            # os.startfile is Windows only, use xdg-open for Linux
+            try:
+                subprocess.Popen(["xdg-open", str(path)])
+                return f"Opened '{path.name}'."
+            except Exception as e:
+                return f"Open failed: {e}"
+        except Exception as e:
+            return f"Open failed: {e}"
+
+    # ════════════════════════════════════════════
+    # SYSTEM TOGGLE SKILLS
+    # ════════════════════════════════════════════
+
+    def _skill_wifi_toggle(self, state: str = "on", *args) -> str:
+        """Toggle WiFi on or off (Windows only)."""
+        if platform.system() != "Windows":
+            return "WiFi toggle is only supported on Windows."
+        action = "enable" if state.strip().lower() in ["on", "enable", "start"] else "disable"
+        try:
+            result = subprocess.run(
+                ["netsh", "interface", "set", "interface", "Wi-Fi", action],
+                capture_output=True, text=True, timeout=10
+            )
+            if result.returncode == 0:
+                return f"WiFi {action}d."
+            return f"WiFi toggle failed: {result.stderr.strip()}"
+        except Exception as e:
+            return f"WiFi toggle failed: {e}"
+
+    def _skill_bluetooth_toggle(self, state: str = "on", *args) -> str:
+        """Toggle Bluetooth on or off (Windows only)."""
+        if platform.system() != "Windows":
+            return "Bluetooth toggle is only supported on Windows."
+        action_bool = "true" if state.strip().lower() in ["on", "enable", "start"] else "false"
+        try:
+            ps_cmd = (
+                "Add-Type -AssemblyName System.Runtime.WindowsRuntime; "
+                "[Windows.Devices.Radios.Radio, Windows.System.Devices, ContentType = WindowsRuntime] | Out-Null; "
+                "$radios = [Windows.Devices.Radios.Radio]::GetRadiosAsync().AsTask().Result; "
+                "$bt = $radios | Where-Object { $_.Kind -eq 'Bluetooth' }; "
+                f"if ($bt) {{ $bt.SetStateAsync([Windows.Devices.Radios.RadioState]::"
+                f"{'On' if action_bool == 'true' else 'Off'}).AsTask().Wait() }}"
+            )
+            result = subprocess.run(
+                ["powershell", "-Command", ps_cmd],
+                capture_output=True, text=True, timeout=15
+            )
+            return f"Bluetooth turned {'on' if action_bool == 'true' else 'off'}."
+        except Exception as e:
+            return f"Bluetooth toggle failed: {e}"
+
+    def _skill_night_light(self, state: str = "on", *args) -> str:
+        """Toggle Night Light on or off (Windows only)."""
+        if platform.system() != "Windows":
+            return "Night Light toggle is only supported on Windows."
+        try:
+            import winreg
+            key_path = r"SOFTWARE\Microsoft\Windows\CurrentVersion\CloudStore\Store\DefaultAccount\Current\default$windows.data.bluelightreduction.bluelightreductionstate\windows.data.bluelightreduction.bluelightreductionstate"
+            # Simplest approach: open Night Light settings
+            os.startfile("ms-settings:nightlight")
+            return f"Night Light settings opened. Please toggle it {'on' if state.strip().lower() in ['on', 'enable'] else 'off'}."
+        except Exception as e:
+            return f"Night Light toggle failed: {e}"
+
+    # ════════════════════════════════════════════
+    # MAX UPTIME SKILL
+    # ════════════════════════════════════════════
+
+    _start_time = datetime.now()
+
+    def _skill_uptime(self, *args) -> str:
+        """Report how long MAX has been running."""
+        delta = datetime.now() - self._start_time
+        hours, remainder = divmod(int(delta.total_seconds()), 3600)
+        minutes, seconds = divmod(remainder, 60)
+        parts = []
+        if hours > 0:
+            parts.append(f"{hours} hour{'s' if hours != 1 else ''}")
+        if minutes > 0:
+            parts.append(f"{minutes} minute{'s' if minutes != 1 else ''}")
+        if not parts:
+            parts.append(f"{seconds} second{'s' if seconds != 1 else ''}")
+        return f"Been running for {', '.join(parts)}."
+
+    # ════════════════════════════════════════════
+    # CHECK PROCESS SKILL
+    # ════════════════════════════════════════════
+
+    def _skill_check_process(self, app_name: str = "", *args) -> str:
+        """Check if a specific application is currently running."""
+        full_name = (app_name + " " + " ".join(args)).strip() if args else app_name.strip()
+        if not full_name:
+            return "Which app should I check?"
+        try:
+            import psutil
+            app_lower = full_name.lower()
+            for proc in psutil.process_iter(['name']):
+                try:
+                    if app_lower in proc.info['name'].lower():
+                        return f"Yes, {full_name} is running (process: {proc.info['name']})."
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+            return f"No, {full_name} is not running."
+        except ImportError:
+            return "Process check needs: pip install psutil"
+        except Exception as e:
+            return f"Process check failed: {e}"
+
+def _number_to_words(n: int) -> str:
+    """Convert integer to English words for better TTS pronunciation."""
+    if n == 0:
+        return "zero"
+    
+    ones = ["", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen", "seventeen", "eighteen", "nineteen"]
+    tens = ["", "", "twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety"]
+    
+    if n < 0:
+        return "minus " + _number_to_words(-n)
+    
+    if n < 20:
+        return ones[n]
+    if n < 100:
+        return tens[n // 10] + (" " + ones[n % 10] if n % 10 != 0 else "")
+    if n < 1000:
+        return ones[n // 100] + " hundred" + (" and " + _number_to_words(n % 100) if n % 100 != 0 else "")
+    if n < 1000000:
+        return _number_to_words(n // 1000) + " thousand" + (" " + _number_to_words(n % 1000) if n % 1000 != 0 else "")
+    return str(n)  # Fallback to digits for huge numbers
 
 # ══════════════════════════════════════════
 # Singleton
