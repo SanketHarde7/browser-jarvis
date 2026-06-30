@@ -79,6 +79,7 @@ AVAILABLE SKILLS (use EXACT names):
 {skills}
 
 SKILL TAG FORMAT: [SKILL:skill_name:param1:param2]
+- For counting: [SKILL:count:<start>:<end>:<reverse_true_or_false>] (e.g. [SKILL:count:1:5:false])
 
 RULES:
 - Each step performs exactly ONE action with ONE skill tag, OR is a pure reasoning/summarizing step with skill set to null.
