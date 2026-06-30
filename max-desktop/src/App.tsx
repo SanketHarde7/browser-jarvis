@@ -242,42 +242,72 @@ const App: React.FC = () => {
     }
   }, [stopSpeaking]);
 
-  // ── Audio playback ──
-  const playAudio = useCallback((rawBase64: string, hibernateAfter: boolean = false, isHealthAlert: boolean = false) => {
-    if (audioRef.current) {
-      audioRef.current.pause();
-      audioRef.current.src = "";
+  // ── Audio playback queue ──
+  const audioQueueRef = useRef<{ rawBase64: string, hibernateAfter: boolean, isHealthAlert: boolean }[]>([]);
+  const isPlayingRef = useRef<boolean>(false);
+
+  const processAudioQueue = useCallback(async () => {
+    if (isPlayingRef.current || audioQueueRef.current.length === 0) return;
+    
+    isPlayingRef.current = true;
+    const nextAudio = audioQueueRef.current.shift();
+    if (!nextAudio) {
+      isPlayingRef.current = false;
+      return;
     }
+
+    const { rawBase64, hibernateAfter, isHealthAlert } = nextAudio;
     setOrbState("speaking");
     const audio = new Audio(`data:audio/mp3;base64,${rawBase64}`);
     audioRef.current = audio;
-
     audio.volume = isHealthAlert ? 0.35 : 1.0;
 
-    audio.onended = async () => {
-      audioRef.current = null;
-      setOrbState("idle");
-      if (hibernateAfter) {
-        await triggerHibernate("audio-ended");
-      }
+    const scheduleHide = () => {
+      if (islandTimerRef.current) clearTimeout(islandTimerRef.current);
+      islandTimerRef.current = window.setTimeout(() => {
+        void hideTextWindow();
+      }, 3000);
     };
 
-    audio.onerror = () => {
-      audioRef.current = null;
-      setOrbState("idle");
-      if (hibernateAfter) {
-        void triggerHibernate("audio-error");
-      }
-    };
+    return new Promise<void>((resolve) => {
+      audio.onended = async () => {
+        audioRef.current = null;
+        if (hibernateAfter) {
+          await triggerHibernate("audio-ended");
+        }
+        resolve();
+      };
 
-    audio.play().catch(() => {
-      audioRef.current = null;
-      setOrbState("idle");
-      if (hibernateAfter) {
-        void triggerHibernate("audio-play-failed");
+      audio.onerror = () => {
+        audioRef.current = null;
+        if (hibernateAfter) {
+          void triggerHibernate("audio-error");
+        }
+        resolve();
+      };
+
+      audio.play().catch(() => {
+        audioRef.current = null;
+        if (hibernateAfter) {
+          void triggerHibernate("audio-play-failed");
+        }
+        resolve();
+      });
+    }).then(() => {
+      isPlayingRef.current = false;
+      if (audioQueueRef.current.length === 0) {
+        setOrbState("idle");
+        scheduleHide();
+      } else {
+        void processAudioQueue();
       }
     });
-  }, [triggerHibernate]);
+  }, [triggerHibernate, hideTextWindow]);
+
+  const playAudio = useCallback((rawBase64: string, hibernateAfter: boolean = false, isHealthAlert: boolean = false) => {
+    audioQueueRef.current.push({ rawBase64, hibernateAfter, isHealthAlert });
+    void processAudioQueue();
+  }, [processAudioQueue]);
 
   // ── Smart follow-up interpreter ──
   const handleVoiceCommandInterpretation = useCallback((userText: string): boolean => {
@@ -424,6 +454,12 @@ const App: React.FC = () => {
           pendingHideRef.current = false;
           writingCompleteRef.current = true;
           setOrbState("idle");
+          
+          if (islandTimerRef.current) clearTimeout(islandTimerRef.current);
+          islandTimerRef.current = window.setTimeout(() => {
+            void hideTextWindow();
+          }, 4000);
+
           if (shouldHibernateRef.current) {
             void triggerHibernate("no-audio");
             shouldHibernateRef.current = false;
