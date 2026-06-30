@@ -10,7 +10,7 @@ from config import config
 from modules.llm import get_response, get_response_with_skill_result, get_greeting, get_acknowledgment
 from modules.skills import get_skills_engine
 from modules.memory import get_memory_manager
-from modules.tts import generate_tts
+from modules.tts import generate_tts, generate_tts_paced
 from modules.gatekeeper import get_gatekeeper
 from modules.Intent_engine import get_intent_engine
 from modules.listening_manager import ListeningManager
@@ -27,6 +27,12 @@ def set_websocket_globals(websocket, loop):
     global _active_websocket, _main_event_loop
     _active_websocket = websocket
     _main_event_loop = loop
+
+def get_active_websocket():
+    return _active_websocket
+
+def get_main_loop():
+    return _main_event_loop
 
 
 def _force_open_app_skill(text: str) -> Optional[str]:
@@ -53,9 +59,14 @@ def _force_open_app_skill(text: str) -> Optional[str]:
     return None
 
 
+_agent_instance = None
+
 class MaxAgent:
 
     def __init__(self):
+        global _agent_instance
+        _agent_instance = self
+        
         self.config = config
         self.memory = get_memory_manager(config)
         self.skills = get_skills_engine(config)
@@ -87,9 +98,21 @@ class MaxAgent:
                 return  
             
             try:
-                await ws.send_json({"event": "response_text", "text": ack_text, "skill_used": None})
+                # ONLY send audio for acknowledgement, do not print on screen.
+                if use_tts:
+                    import os
+                    import base64
+                    tts_path = await generate_tts(ack_text)
+                    if tts_path and os.path.exists(tts_path):
+                        with open(tts_path, "rb") as f:
+                            encoded_audio = base64.b64encode(f.read()).decode('utf-8')
+                            await ws.send_json({"event": "audio_response", "audio": encoded_audio})
+                        try:
+                            os.remove(tts_path)
+                        except Exception:
+                            pass
             except Exception as e:
-                logger.debug(f"Ack text send failed: {e}")
+                logger.debug(f"Ack text/audio send failed: {e}")
                 return  
         except Exception as e:
             logger.debug(f"Ack dispatch failed: {e}")
@@ -174,6 +197,7 @@ class MaxAgent:
                     tts_path = ""
                     if use_tts and final_response:
                         tts_path = await generate_tts(self.gatekeeper.filter_for_tts(final_response))
+                        print(f"🟢 [TRACKER: FAST-9] Audio Generated! Path: {tts_path}")
                     return {"response": final_response, "tts_path": tts_path, "skill_used": skill_tag, "intent": "fast_brain"}
 
                 # Resolve text
@@ -572,6 +596,18 @@ class MaxAgent:
             if any(cmd in text_clean for cmd in ["save karo", "save", "ctrl s", "file save"]):
                 pyautogui.hotkey('ctrl', 's')
                 return {"response": "", "skill_used": "hotkey_save"}
+            if any(cmd in text_clean for cmd in ["find", "search karo", "kuch dhundna", "ctrl f"]):
+                pyautogui.hotkey('ctrl', 'f')
+                return {"response": "", "skill_used": "hotkey_find"}
+            if any(cmd in text_clean for cmd in ["print karo", "print this", "ctrl p"]):
+                pyautogui.hotkey('ctrl', 'p')
+                return {"response": "", "skill_used": "hotkey_print"}
+            if any(cmd in text_clean for cmd in ["zoom in", "bada karo", "zoom badhao"]):
+                pyautogui.hotkey('ctrl', '+')
+                return {"response": "", "skill_used": "hotkey_zoom_in"}
+            if any(cmd in text_clean for cmd in ["zoom out", "chota karo", "zoom kam karo"]):
+                pyautogui.hotkey('ctrl', '-')
+                return {"response": "", "skill_used": "hotkey_zoom_out"}
 
             # Scroll
             if any(cmd in text_clean for cmd in ["scroll up", "upar scroll", "page up"]):
@@ -702,6 +738,8 @@ class MaxAgent:
                     type_text = type_match.group(1).strip()
                 if type_text:
                     _release_modifiers()
+                    import time
+                    time.sleep(1.5)
                     pyautogui.write(type_text + " ", interval=0.01)
                     return {"response": "", "skill_used": "ghost_dictation"}
 
@@ -711,6 +749,8 @@ class MaxAgent:
                 final_type_text = LocalFastBrain.strip_wake_word(user_text)
                 if final_type_text:
                     _release_modifiers()
+                    import time
+                    time.sleep(1.5)
                     pyautogui.write(final_type_text + " ", interval=0.01)
                 return {"response": "", "skill_used": "ghost_typing_mode"}
             else:
