@@ -37,6 +37,7 @@ class Config:
     HOST: str = os.getenv("HOST", "0.0.0.0")
     PORT: int = int(os.getenv("PORT", "8000"))
     SKILLS_ENABLED: bool = True
+    COUNTING_PAUSE: float = float(os.getenv("COUNTING_PAUSE", "0.8"))
 
     # ── Paths ──
     PROJECT_ROOT: Path = PROJECT_ROOT
@@ -89,7 +90,7 @@ class Config:
     # ── AI Models ──
     LLM_MODEL: str = os.getenv("LLM_MODEL", "llama-3.3-70b-versatile")
     WHISPER_MODEL: str = os.getenv("WHISPER_MODEL", "whisper-large-v3")
-    VISION_MODEL: str = os.getenv("VISION_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
+    VISION_MODEL: str = os.getenv("VISION_MODEL", "Qwen/Qwen3.6-27B")
 
     # ── Groq Rate-Limit Manager ──
     # Free tier ≈ 30 requests/min per key → keep a small safety margin.
