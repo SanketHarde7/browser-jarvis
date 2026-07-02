@@ -15,6 +15,10 @@ from modules.gatekeeper import get_gatekeeper
 from modules.Intent_engine import get_intent_engine
 from modules.listening_manager import ListeningManager
 from modules.agent_loop import get_agent_loop, is_complex_goal
+from modules.orchestrator import (
+    DIRECT, NEEDS_APPROVAL, approval_reply_kind, cancel_task, classify_complexity,
+    get_status_summary, pop_pending_approval, remember_pending_approval, start_orchestrator_background,
+)
 
 logger = logging.getLogger("MAX.AGENT")
 
@@ -222,6 +226,45 @@ class MaxAgent:
             except Exception:
                 pass
             combined_context = kb_prefix + memory_context
+
+            # 🧠 ORCHESTRATOR APPROVAL GATE — after Ghost Mode, before normal LLM routing.
+            lowered = text.lower().strip()
+            if any(p in lowered for p in ["what's the status", "what is the status", "status kya", "kya chal raha", "what is happening"]):
+                status_text = get_status_summary()
+                if use_tts and status_text:
+                    tts_path = await generate_tts(self.gatekeeper.filter_for_tts(status_text))
+                else:
+                    tts_path = ""
+                return {"response": status_text, "tts_path": tts_path, "skill_used": "orchestrator_status", "intent": "orchestrator_status"}
+
+            if any(p in lowered for p in ["stop the task", "cancel the research", "cancel task", "abort task"]):
+                cancel_text = cancel_task()
+                tts_path = await generate_tts(cancel_text) if use_tts else ""
+                return {"response": cancel_text, "tts_path": tts_path, "skill_used": "orchestrator_cancel", "intent": "orchestrator_cancel"}
+
+            pending = pop_pending_approval()
+            if pending:
+                approval = approval_reply_kind(text)
+                if approval == "yes":
+                    task_id = start_orchestrator_background(pending.get("query", text), pending.get("context", combined_context))
+                    response = f"Deep Orchestrator started. Task ID: {task_id}. You can ask for status anytime."
+                    tts_path = await generate_tts(self.gatekeeper.filter_for_tts(response)) if use_tts else ""
+                    return {"response": response, "tts_path": tts_path, "skill_used": "orchestrator", "intent": "orchestrator_started", "task_id": task_id}
+                if approval == "no":
+                    text = pending.get("query", text)
+                    combined_context = pending.get("context", combined_context)
+                else:
+                    remember_pending_approval(pending.get("query", text), pending.get("context", combined_context))
+                    response = "Choose normal mode or deep Orchestrator mode for that task."
+                    tts_path = await generate_tts(response) if use_tts else ""
+                    return {"response": response, "tts_path": tts_path, "skill_used": None, "intent": "orchestrator_approval"}
+
+            complexity = await classify_complexity(text, combined_context)
+            if complexity == NEEDS_APPROVAL:
+                remember_pending_approval(text, combined_context)
+                response = "This looks like a deep task. Should MAX use normal mode or go deep with the Orchestrator? Deep mode is more thorough and takes longer."
+                tts_path = await generate_tts(self.gatekeeper.filter_for_tts(response)) if use_tts else ""
+                return {"response": response, "tts_path": tts_path, "skill_used": None, "intent": "orchestrator_approval"}
 
             print("🟢 [TRACKER: 7] Checking Intent...")
             intent = await self.intent_engine.classify(text)

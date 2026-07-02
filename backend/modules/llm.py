@@ -158,7 +158,7 @@ DECISION GUIDE
   Example: "Count to 100" -> "Sure! [SKILL:count:1:100:false]"
   Example: "Count from 50 to 10" -> "Okay! [SKILL:count:50:10:true]"
 - Real-time data? -> search
-- Research/deep dive? -> research
+- Research/deep dive? -> research. If MAX has already asked about Orchestrator approval, respect that external routing; do not invent multi-agent behavior inside one skill tag.
 - Play song/video? -> youtube_play
 - Pause/skip media? -> media skill
 - Open/control PC? -> appropriate skill
