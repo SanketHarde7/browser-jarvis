@@ -1,0 +1,459 @@
+# MAX Orchestrator Engine — Master Architecture & Implementation Plan (v1.0)
+
+**Document Purpose:** This is the single source of truth for implementing the Orchestrator upgrade to MAX. It is written for a coding agent (Antigravity / Kimi / Codex / Claude Code) to read once and implement without needing clarification. Every decision recorded here was explicitly confirmed by the project owner (Sanket). Do not deviate from these decisions without flagging it back to the human.
+
+**Scope of this upgrade:** This plan covers ONLY two things:
+1. The **Orchestrator Core + Blackboard + Sub-Agent framework** (the general-purpose engine).
+2. The **Deep Research Mode** as the first real, fully-specified use case built on top of that engine.
+
+**Explicitly OUT of scope for this document:** Plug-and-Play Skill Ingestion, Self-Correction (as a standalone pillar beyond the basic failure-handling described here), and the Coding Worker sub-agent (parked — will be a separate follow-up document once finalized). Do not build these now. Leave clean extension points instead (documented in Section 10).
+
+---
+
+## 1. Executive Summary — What Changes for the User
+
+Today, MAX is a **linear command executor**. One command comes in, one skill runs, result comes back, done. There is no concept of a background task, no shared memory between skills, no multi-step autonomous behavior.
+
+After this upgrade, MAX gains a **second mode of operation** that sits ALONGSIDE the current behavior — it does not replace it.
+
+- **Mode A — Direct Mode (existing, unchanged):** Daily, fast, simple commands ("open YouTube", "what's on my screen", "set a timer") continue to be handled exactly as they are today — no Orchestrator, no Blackboard, no sub-agents, no added latency. This is the default for everything.
+- **Mode B — Orchestrator Mode (new):** Triggered ONLY when a query is genuinely multi-step, long-running, and needs multiple tools/agents working together (e.g., Deep Research). MAX detects this, **asks the user for explicit approval** before switching into this mode, and only proceeds if the user says yes.
+
+The Orchestrator, once approved, becomes a **lightweight supervisor**: it plans a roadmap, delegates real work to sub-agents, watches their progress on a shared Blackboard, makes routing/continuation decisions, talks to the user when needed, and manages shared resources (API keys, concurrency limits). It does NOT do the heavy lifting itself.
+
+---
+
+## 2. High-Level System Flow
+
+```
+                              ┌─────────────────────┐
+                              │   User Query (Voice/ │
+                              │   Text) via MAX      │
+                              └──────────┬───────────┘
+                                         │
+                              ┌──────────▼───────────┐
+                              │  Complexity Classifier│
+                              │  (agent_core.py)      │
+                              └──────────┬───────────┘
+                                         │
+                     ┌───────────────────┴───────────────────┐
+                     │                                        │
+              [ Simple / Daily ]                     [ Complex / Multi-step ]
+                     │                                        │
+                     ▼                                        ▼
+          ┌────────────────────┐                  ┌────────────────────────┐
+          │  Direct Mode        │                  │ Ask User for Approval:  │
+          │  (current llm.py +  │                  │ "This looks like a      │
+          │   skills.py flow,   │                  │  deep/complex task.     │
+          │   UNCHANGED)        │                  │  Use Orchestrator?"     │
+          └────────────────────┘                  └───────────┬─────────────┘
+                                                                │
+                                              ┌─────────────────┴──────────────────┐
+                                              │                                     │
+                                          [ User: No ]                        [ User: Yes ]
+                                              │                                     │
+                                              ▼                                     ▼
+                                    ┌────────────────────┐             ┌─────────────────────────┐
+                                    │ Fall back to Direct │             │   ORCHESTRATOR ACTIVATED │
+                                    │ Mode (best effort)  │             │   (orchestrator.py)      │
+                                    └────────────────────┘             └────────────┬─────────────┘
+                                                                                     │
+                                                                        ┌────────────▼─────────────┐
+                                                                        │  1. Build Roadmap          │
+                                                                        │  (which agents, which       │
+                                                                        │   tools, what order,        │
+                                                                        │   dependencies)              │
+                                                                        └────────────┬─────────────┘
+                                                                                     │
+                                                                        ┌────────────▼─────────────┐
+                                                                        │  2. Init Blackboard entry   │
+                                                                        │     for this task_id        │
+                                                                        └────────────┬─────────────┘
+                                                                                     │
+                                                          ┌──────────────────────────┼──────────────────────────┐
+                                                          ▼                          ▼                          ▼
+                                                ┌──────────────────┐      ┌──────────────────┐      ┌──────────────────┐
+                                                │  Sub-Agent A       │      │  Sub-Agent B       │      │  Sub-Agent C       │
+                                                │  (e.g. search)     │      │  (e.g. scrape)     │      │  (e.g. browser-LLM)│
+                                                │  writes state to   │      │  writes state to   │      │  writes state to   │
+                                                │  Blackboard         │      │  Blackboard         │      │  Blackboard         │
+                                                └─────────┬─────────┘      └─────────┬─────────┘      └─────────┬─────────┘
+                                                          │                          │                          │
+                                                          └──────────────┬───────────┴──────────────┬───────────┘
+                                                                         ▼                            
+                                                              ┌──────────────────────┐
+                                                              │  Orchestrator reads    │
+                                                              │  Blackboard, decides   │
+                                                              │  next step / retry /   │
+                                                              │  skip / ask user       │
+                                                              └───────────┬──────────┘
+                                                                          │
+                                                        ┌─────────────────┴──────────────────┐
+                                                        │                                     │
+                                                 [ More steps left ]                   [ Task complete ]
+                                                        │                                     │
+                                                        ▼                                     ▼
+                                            (loop back to dispatch                 ┌────────────────────┐
+                                             next sub-agent step)                  │  Final synthesis +   │
+                                                                                    │  deliver result to   │
+                                                                                    │  user via MAX voice/  │
+                                                                                    │  text                │
+                                                                                    └────────────────────┘
+```
+
+**Concurrent interaction (always active during Orchestrator Mode):**
+```
+User (mid-task) ──"what's the status?"──▶ MAX reads Blackboard (read-only, non-blocking) ──▶ answers instantly
+User (mid-task) ──new unrelated query───▶ Complexity Classifier runs again independently ──▶ may spin up parallel task_id
+```
+
+---
+
+## 3. Complexity Detection & Approval Gate
+
+### 3.1 Where this lives
+New logic inside `agent_core.py`, run AFTER Ghost Mode check fails (i.e., it's not a known instant shortcut) and BEFORE the query is handed to `llm.py`'s normal single-shot decision flow.
+
+### 3.2 Detection logic (generic, not hardcoded to research only)
+A query is flagged **potentially complex** if it matches ANY of these signals:
+1. **Multi-tool signal** — the query implies more than one distinct capability domain is needed (e.g., web research + file writing + cross-verification; or multi-site browser automation + data aggregation).
+2. **Unbounded/long-duration signal** — the query implies an open-ended amount of work rather than one bounded action (e.g., "research X thoroughly", "compare 10 products across different sites", "build and test a full project").
+3. **Iterative/self-directed signal** — the task requires the system to evaluate its own intermediate output and decide whether to continue (e.g., "until you have full understanding", "keep digging", "make sure it's accurate").
+
+If NONE of these match → straight to Direct Mode, no LLM call needed beyond the normal one (keep it cheap and fast — do not burn a Groq call just to classify every single command; use fast heuristic/regex pre-filter first, only escalate to a lightweight LLM classification call if the heuristic is ambiguous).
+
+If ANY match → MAX asks the user explicitly. Standard phrasing pattern (MAX should generate a natural variant of this, not a robotic fixed string):
+
+> "Boss, this looks like a deep task. Should I use normal mode or go deep with the Orchestrator (multi-agent, more thorough, will take longer)?"
+
+- User says **normal / no** → proceed via Direct Mode, best-effort single-pass (this is exactly today's current behavior, e.g. current research engine flow unchanged).
+- User says **deep / yes / orchestrator** → proceed to Section 4 (Orchestrator activation).
+- This approval question is asked **every time** a complex query is detected — it is NOT a one-time toggle/setting. (Per Sanket: "abhi ke liye approval based hoga" — this is a per-query gate, not a persistent mode switch, unless changed later.)
+
+### 3.3 Research is the first concrete example, not a special case
+Research queries will almost always trip signal #2 and #3 above. When they do, the two options MAX offers map directly onto:
+- **Normal research** = current existing single-pass research engine (Section 1-4 pipeline described in the ground-truth doc: DuckDuckGo → scrape 3 URLs → outline → critic pass → chunked write).
+- **Deep research** = new Orchestrator-driven multi-agent research pipeline (Section 6 of this document).
+
+---
+
+## 4. Orchestrator Core
+
+### 4.1 File: `backend/modules/orchestrator.py` (NEW)
+
+Responsibilities:
+1. Receive the approved complex query + conversation context.
+2. Load a predefined **Playbook/Template** for known complex tasks (like Deep Research). If the task is completely novel, call the LLM (Groq, cheap/fast model) to generate a **Roadmap** dynamically. This prevents unnecessary latency and hallucination for standard tasks.
+3. Create a new `task_id` (UUID) and initialize its entry on the Blackboard.
+4. Dispatch sub-agents according to the roadmap, respecting dependencies (some steps are sequential, some can run in parallel — the roadmap must mark this explicitly).
+5. Continuously poll/watch the Blackboard for state changes (success/fail/timeout/needs-input) and react (Section 4.4).
+6. Own the Resource Manager (Section 7) — decides how many sub-agents can be dispatched right now based on current load and API key budget.
+7. Communicate with the user proactively when needed (errors requiring input, milestones, hidden-feature triggers like focus-window), and reactively when asked (status queries).
+8. On completion, synthesize/collect the final result and hand it back to MAX's normal TTS/text output path.
+
+### 4.2 Roadmap Schema (output of step 2 above)
+Whether loaded from a Playbook Template or generated dynamically by the LLM, the roadmap MUST strict JSON in this shape (never prose, never nested tags mixed with text):
+
+```json
+{
+  "task_id": "uuid-generated-by-code-not-llm",
+  "goal": "one-line restatement of what the user actually wants",
+  "steps": [
+    {
+      "step_id": "s1",
+      "agent": "search_agent",
+      "depends_on": [],
+      "input_spec": "what this step needs to start",
+      "output_spec": "what this step must produce",
+      "parallel_group": null
+    },
+    {
+      "step_id": "s2",
+      "agent": "scrape_agent",
+      "depends_on": ["s1"],
+      "input_spec": "...",
+      "output_spec": "...",
+      "parallel_group": "group_a"
+    }
+  ],
+  "stopping_condition": "coverage_based",
+  "max_iterations_safety_cap": 8
+}
+```
+
+Notes:
+- `parallel_group` — steps sharing the same non-null group value are allowed to run concurrently (subject to Resource Manager approval). Steps with `depends_on` unmet cannot start.
+- `stopping_condition` is always `"coverage_based"` for research-type tasks per Sanket's explicit instruction (time is NOT the cap; depth/coverage is). `max_iterations_safety_cap` exists purely as a runaway-loop safety net, not as the intended stopping mechanism — it should be set generously (e.g. 8-15) so it almost never triggers in practice.
+
+### 4.3 Dispatch Logic (pseudocode)
+
+```python
+def run_orchestrator(query, task_id):
+    roadmap = generate_roadmap(query)  # one Groq call
+    blackboard.init_task(task_id, roadmap)
+
+    while not blackboard.is_task_complete(task_id):
+        ready_steps = blackboard.get_ready_steps(task_id)  # deps satisfied, not yet started
+        dispatchable = resource_manager.filter_by_capacity(ready_steps)
+
+        for step in dispatchable:
+            spawn_subagent(step, task_id)  # async, non-blocking
+
+        newly_finished = blackboard.poll_state_changes(task_id)
+        for result in newly_finished:
+            decision = orchestrator_decide_next(result, roadmap, blackboard)
+            apply_decision(decision)  # may modify roadmap: add step, skip step, retry step, ask user
+
+        if blackboard.needs_user_input(task_id):
+            notify_user_and_wait()  # non-blocking to other parallel steps
+
+    return blackboard.synthesize_final_result(task_id)
+```
+
+### 4.4 Orchestrator Decision Types
+When a sub-agent reports back via the Blackboard, the Orchestrator's next action is always one of:
+- `CONTINUE` — proceed to next roadmap step as planned.
+- `SKIP_REDUNDANT` — a later step's goal was already satisfied by an earlier step's output (e.g., Agent B was about to fetch data Agent A already got) → skip, mark as `skipped_redundant` on Blackboard, still consider it "done" for dependency purposes.
+- `EXPAND` — coverage is insufficient (research case), Orchestrator adds a NEW step to the roadmap dynamically (e.g., another search sub-agent with a refined query).
+- `RETRY` — see Section 5 (failure handling).
+- `ASK_USER` — see Section 5.
+- `COMPLETE` — stopping condition met, move to synthesis.
+
+---
+
+## 5. Failure Handling & Human-in-the-loop Protocol
+
+This is intentionally minimal (full self-correction with alternate-route-finding is a future pillar, NOT this document). The rule set below is exactly what was approved — implement it literally.
+
+### 5.1 Default automatic behavior (no user input yet)
+When a sub-agent step fails or times out:
+1. Orchestrator attempts **ONE automatic retry** if the failure looks transient/logical to retry (e.g., network timeout, page load timeout, rate-limit backoff). Do not blindly retry things that clearly won't succeed on retry (e.g., "element not found" after a page structurally changed — that needs a different approach, not a retry).
+2. If the retry also fails → Orchestrator writes the error to the Blackboard AND immediately notifies the user. It does NOT sit silently, and it does NOT infinite-retry.
+
+### 5.2 User-directed response handling (three explicit cases)
+Once MAX has surfaced a failure to the user, the user's reply is free-form. MAX/Orchestrator must interpret it and route it into exactly one of these three behaviors:
+
+**Case 1 — "Main try karke dekhta hu, tum ruko" (user will manually intervene)**
+- Orchestrator pauses that specific step (does not block unrelated parallel steps).
+- Waits up to **1–2 minutes** for a follow-up user message.
+- If user responds with confirmation ("kar diya" / "done" / "ho gaya") within that window → treat step as resolved, Orchestrator re-checks/continues from there (may re-verify state depending on step type).
+- If no response arrives within the window → Orchestrator proactively asks: **"hua kya?"** (does not just keep waiting silently forever).
+
+**Case 2 — "Dubara try karo, 1 minute ruko phir try karo" (explicit retry instruction with timing)**
+- Orchestrator follows the exact retry/wait pattern the user specified.
+- If it still fails after following those instructions → reports back to user again with the outcome. Does not silently give up, does not silently keep looping beyond what was asked.
+
+**Case 3 — "Skip kar do"**
+- Step is marked `skipped_by_user` on the Blackboard.
+- Orchestrator proceeds with the rest of the roadmap treating this step's output as absent/empty (downstream steps that strictly depend on it should be flagged, not silently fed garbage — Orchestrator should note in synthesis "X was skipped, so Y is incomplete").
+
+### 5.3 Hidden feature — Focus Window trigger
+If, at any point (including inside these failure-recovery conversations), the user says something like "focus window mein kaam karo" / "focus mode se try karo":
+- Orchestrator/relevant sub-agent brings the target application window into focus (OS-level, reuse/extend existing `win32gui` context engine utilities already used elsewhere in MAX) BEFORE re-attempting the action.
+- This is a general-purpose instruction usable inside any recovery conversation, not just one specific agent.
+
+### 5.4 Task Cancellation (Abort)
+If the user says "Stop the task", "Cancel the research", or similar mid-task:
+- Orchestrator detects this through the main listening loop.
+- It immediately writes a `CANCEL` signal to the Blackboard for that `task_id`.
+- All running sub-agents check for this signal periodically and terminate gracefully.
+- Orchestrator confirms cancellation via TTS: "Task cancelled, sir."
+
+### 5.5 Crash Recovery
+If MAX crashes or the PC restarts mid-task:
+- On next boot, Orchestrator checks the Blackboard SQLite for tasks stuck in `running` or `pending` state.
+- Orchestrator asks the user: "Sir, a previous deep task was interrupted. Should I resume it?"
+- If yes, Orchestrator picks up exactly where it left off, reading the last completed states from the Blackboard.
+
+---
+
+## 6. Deep Research Mode — Full Sub-Agent Breakdown
+
+This is the first concrete Orchestrator use case. The current single-pass research engine (search → scrape 3 URLs → outline → critic → chunked write, all in ~15-20 seconds) gets broken into the following specialized sub-agents. None of these are hardcoded pipelines anymore — the Orchestrator sequences and repeats them based on live decisions.
+
+### 6.1 Sub-Agents
+
+**`search_agent`**
+- Input: a search query string.
+- Action: hits DuckDuckGo (existing method), returns a list of candidate URLs (not just top 3 — return more candidates, e.g. top 8-10, so `evaluate_agent` has real choices).
+- Output → Blackboard: `{query, candidate_urls[]}`.
+
+**`scrape_agent`**
+- Input: a URL.
+- Action: fetches and extracts page content (extend beyond "first 50 paragraphs" — extract full readable content, then let `evaluate_agent` decide what's useful rather than truncating blindly upfront).
+- Output → Blackboard: `{url, raw_text, scrape_success: bool}`.
+
+**`evaluate_agent`** (this is the NEW "intelligence" layer Sanket specifically asked for)
+- Input: scraped raw_text + the original sub-question it's meant to answer.
+- Action: a cheap/fast LLM call (Groq) — NOT the Selenium browser tab — judges: (a) is this genuinely useful/on-topic content or junk/ads/fluff, (b) if useful, extract just the relevant facts (not the whole page), (c) assign a confidence/relevance note.
+- Output → Blackboard: `{url, is_useful: bool, extracted_facts: str, relevance_note: str}`.
+- Rationale for using Groq here instead of the browser tab: this is a high-frequency, low-complexity judgment call (potentially dozens of times per research task). Per Sanket's explicit instruction, the Selenium browser-tab LLM conversation is reserved for the actual "thinking/reasoning/expert" work, not bulk filtering — this keeps the persistent browser conversation focused and keeps Groq usage paced (see Section 7).
+
+**`browser_reasoning_agent`** (this is the "curious expert" — the persistent Selenium tab)
+- This is the SINGLE most important behavioral change from the current system. Today, Selenium opens fresh prompts per stage (outline prompt, then critic prompt, then chunk-writing prompts) somewhat disconnected. Going forward:
+  - **One single persistent browser tab/conversation thread is opened per research task** and stays open for the ENTIRE task duration (this is the "human sitting and researching" feel Sanket described).
+  - Every time MAX has gathered a new batch of evaluated/useful facts (from `evaluate_agent`), it feeds them into THIS SAME conversation thread as a follow-up message — not a new isolated prompt.
+  - The browser LLM's job in this thread is to actually think out loud: "here's what we have so far, here's what's still missing, here's a gap in coverage, here's what to search next."
+  - Orchestrator parses this response for TWO things: (1) a natural-language reasoning/status which gets shown to the user if asked, and (2) a structured directive extracted from it — e.g., new search queries to run, or "sufficient coverage reached, proceed to synthesis."
+  - Output → Blackboard: `{coverage_assessment, next_search_queries[], sufficient: bool}`.
+
+**`writer_agent`**
+- Only invoked once `browser_reasoning_agent` signals `sufficient: true`.
+- Uses the SAME persistent browser thread (it already has full context of everything gathered) to produce the final structured, chaptered output — reusing the existing chunked-append-to-file mechanism already built (Stage 3 in the ground-truth doc), so large output isn't lost to context/response-length limits.
+- Output: appends to the live output file, same mechanism as today.
+
+### 6.2 The Loop, Concretely
+
+```
+1. Orchestrator generates initial sub-questions from user's topic (via Groq planning call)
+2. For each sub-question → search_agent runs (parallel across sub-questions where possible)
+3. For each candidate URL returned → scrape_agent runs
+4. For each scraped page → evaluate_agent runs, filters junk, extracts real facts
+5. All useful extracted_facts across this round get sent as ONE message into the
+   persistent browser_reasoning_agent thread
+6. browser_reasoning_agent responds: what's covered, what's missing, next queries
+7. Orchestrator reads that response:
+      - if not sufficient → generate new search_agent tasks for the gaps, GOTO step 2
+      - if sufficient → proceed to writer_agent
+8. writer_agent produces final chaptered document via existing chunked-append mechanism
+9. Orchestrator tells user: "Research complete, saved to <file>."
+```
+
+This loop is exactly what makes the task genuinely long-running — NOT because of artificial delays, but because real search → scrape → evaluate → reason cycles are happening, potentially many rounds, until genuine topic coverage is reached. Duration is a natural byproduct, never an artificial target.
+
+### 6.3 Cross-Verification
+When `browser_reasoning_agent` treats a fact as important/central to the topic, Orchestrator should ensure at least one additional independent source was scraped and evaluated as corroborating it before it's treated as "confirmed" in the final write-up. Facts sourced from only a single page should be written with a soft qualifier (e.g., "according to one source...") rather than stated as flatly settled — this can be handled as an instruction inside the persistent reasoning thread's system prompt rather than as a separate code module.
+
+### 6.4 Prompting Upgrade (persona-driven system prompt for `browser_reasoning_agent`)
+Replace the current bare "generate outline" / "write this chapter" prompts with a persistent system-level framing injected once at the start of the browser thread, establishing:
+- Persona: a genuinely curious, expert-level research partner who is actively sitting with the data, not a passive summarizer.
+- Explicit reasoning behavior expected at every turn: acknowledge what's new, connect it to what's already known, explicitly call out gaps, decide what's still missing before agreeing to move to writing.
+- Explicit instruction to flag single-source/unconfirmed claims.
+- Explicit instruction on when it's allowed to say "coverage sufficient, ready to write" — should not rush to this.
+
+(Exact prompt wording is an implementation detail for the coding agent to draft and iterate on — the behavioral requirements above are the hard constraints.)
+
+---
+
+## 7. Resource Management (Concurrency + API Budget)
+
+### 7.1 Why this matters
+This entire system runs on **free-tier resources** (multiple free Groq API keys, no paid API budget) on a **local personal PC**, not a server. The Orchestrator must never assume unlimited capacity.
+
+### 7.2 API Key Pool Manager
+New module: `backend/modules/resource_manager.py` (NEW)
+- Maintains a pool of Groq API keys (currently 4, expandable — code must treat the count as configurable/dynamic, read from a config/env list, not hardcoded to 4).
+- Tracks per-key rate-limit usage (requests/tokens per minute, per Groq's published limits) in-memory.
+- On every Groq call request from any part of the system (evaluate_agent, roadmap planning, gap-analysis parsing, etc.), the Resource Manager selects the least-recently-used / least-loaded key from the pool automatically — callers should never hardcode which key they use.
+- If ALL keys are near their rate limit, Resource Manager makes the CALLER WAIT (backoff) rather than fail — and it should throttle the PACE of new sub-agent dispatch accordingly (i.e., if API budget is tight, spin up fewer parallel `evaluate_agent` calls at once, queue the rest).
+
+### 7.3 Parallel Sub-Agent Limit
+- No hardcoded fixed number of max-parallel-agents. Resource Manager computes a safe concurrency ceiling dynamically based on:
+  - Current available API budget across the key pool (from 7.2).
+  - Basic local system load signals (reuse `psutil`, already a dependency per the ground-truth doc, to check current CPU/RAM headroom before greenlighting more parallel browser-automation-heavy agents especially, since Selenium/Chrome instances are RAM-heavy).
+- `resource_manager.filter_by_capacity(ready_steps)` (referenced in Section 4.3 pseudocode) is the single choke point all dispatch must pass through.
+
+### 7.4 Selenium/Browser Tab Budget
+- The persistent `browser_reasoning_agent` thread (Section 6) is a SINGLE browser tab per active research task — this is intentionally not parallelized per sub-question, because the whole point is one continuous context-aware conversation. Only `evaluate_agent`-style bulk work is parallelized, and that goes through Groq, not Selenium — this naturally keeps Selenium/Chrome instance count low regardless of how many search/scrape/evaluate steps are running.
+
+---
+
+## 8. Blackboard Architecture
+
+### 8.1 File: `backend/modules/blackboard.py` (NEW)
+
+### 8.2 Storage
+Given this is local-first and needs to survive process states within a task's lifetime (and ideally be inspectable/debuggable), use SQLite (already consistent with MAX's existing two-tier Pattern Memory SQLite approach). A single table is sufficient for v1:
+
+```sql
+CREATE TABLE blackboard (
+    task_id TEXT NOT NULL,
+    step_id TEXT NOT NULL,
+    agent_name TEXT NOT NULL,
+    status TEXT NOT NULL,          -- 'pending' | 'running' | 'success' | 'failed' | 'skipped_redundant' | 'skipped_by_user' | 'needs_user_input'
+    depends_on TEXT,               -- JSON list of step_ids
+    input_data TEXT,               -- JSON
+    output_data TEXT,              -- JSON, the actual result data (NOT just a status flag — per explicit requirement that other agents can consume this directly)
+    error_message TEXT,
+    created_at TIMESTAMP,
+    updated_at TIMESTAMP,
+    PRIMARY KEY (task_id, step_id)
+);
+```
+
+### 8.3 Access Rules
+- Sub-agents ONLY ever WRITE their own step's row (status transitions + output_data). They never read or modify other agents' rows directly. 
+- **Concurrency Safety:** Because multiple parallel sub-agents (e.g. 5 evaluate agents) might attempt to write to SQLite simultaneously, all writes MUST go through a queue or implement retry logic to prevent `database is locked` errors.
+- Orchestrator has full read access across all rows for a task_id, and is the only component allowed to create new rows dynamically (e.g., when `EXPAND` decision adds a new search step mid-task) or mark redundancy skips.
+- MAX's status-query handler (for "what's happening?" mid-task questions) reads this table directly, read-only, and formats a natural-language summary — this must be a fast, non-blocking read so it never competes with or slows down running sub-agents.
+
+---
+
+## 9. Dynamic vs. Direct Mode — Where the Switch Actually Lives
+
+To be unambiguous for implementation:
+
+- `agent_core.py` gets a new check inserted right after the existing Ghost Mode regex check and before the query is routed into `llm.py`'s current SYSTEM_PROMPT/DECISION GUIDE flow.
+- This check calls a new lightweight function `classify_complexity(query, context)` living in `orchestrator.py`.
+- Returns one of: `DIRECT` (route to existing llm.py flow, nothing changes), or `NEEDS_APPROVAL` (MAX asks the approval question from Section 3.2, then branches based on the answer).
+- If the user approves → `orchestrator.run_orchestrator(query, new_task_id)` is invoked. 
+- **Event Loop Safety:** The Orchestrator loop MUST run in a separate Thread or Process so it does not block the primary STT/VAD listening loop in `listening_manager.py`.
+
+This guarantees **zero regression risk** to all of MAX's current daily-use functionality — Direct Mode's code path is untouched.
+
+---
+
+## 10. File-by-File Implementation Plan
+
+*(Follow the "check if already exists" guard convention already established in MAX's codebase for all new files/functions.)*
+
+### New files:
+| File | Responsibility |
+|---|---|
+| `backend/modules/orchestrator.py` | Core orchestrator: roadmap generation, dispatch loop, decision logic (Sections 4, 5) |
+| `backend/modules/blackboard.py` | SQLite-backed shared state store + access API (Section 8) |
+| `backend/modules/resource_manager.py` | API key pool rotation, rate-limit tracking, dynamic concurrency ceiling (Section 7) |
+| `backend/modules/agents/search_agent.py` | Section 6.1 |
+| `backend/modules/agents/scrape_agent.py` | Section 6.1 (may reuse/extend existing scraping helper functions already in the current research engine module — do not duplicate) |
+| `backend/modules/agents/evaluate_agent.py` | Section 6.1 |
+| `backend/modules/agents/browser_reasoning_agent.py` | Section 6.1, 6.4 — wraps existing Selenium/`undetected_chromedriver` session logic, but restructured for persistent multi-turn use instead of one-shot prompts |
+| `backend/modules/agents/writer_agent.py` | Section 6.1 — reuses existing chunked-append-to-file logic from current research engine |
+
+### Modified files:
+| File | Change |
+|---|---|
+| `backend/agent_core.py` | Insert complexity-check branch point (Section 9) after Ghost Mode, before normal llm.py routing |
+| `backend/modules/llm.py` | Add DECISION GUIDE entries so the LLM knows Orchestrator exists as a concept when relevant (e.g., so it doesn't try to invent its own multi-step behavior inside a single `[SKILL:...]` tag) — no core routing logic changes needed otherwise |
+| existing research engine module (wherever the current Section 1-4 pipeline from the ground-truth doc currently lives) | Left fully intact and untouched for "Normal Research" mode. Deep Research mode is entirely new code that reuses only the low-level helpers (DuckDuckGo search call, page scraping helper, Selenium session bootstrap, chunked file-append) — extract these into shared utility functions if they are currently inline/duplicated, so both Normal and Deep research modes call the same underlying primitives without copy-pasting |
+
+### Explicit extension points to leave clean (for future pillars, NOT built now):
+- `resource_manager.py` should expose its capacity-check function generically enough that a future Self-Correction pillar could later plug in smarter retry/alternate-route logic without rewriting it.
+- `orchestrator.py`'s agent dispatch should look up agents from a registry dict (`agent_name -> callable`), not a hardcoded if/else chain — this is what will make future Plug-and-Play skill ingestion and the future Coding Worker sub-agent easy to register later without touching this file's core loop.
+
+---
+
+## 11. Testing & Validation Checklist (for the coding agent to self-verify before calling this done)
+
+1. Direct Mode regression: every existing skill/command in the ground-truth capabilities ledger still works exactly as before, with no added latency or behavior change.
+2. Complexity classifier correctly returns `DIRECT` for simple daily commands (screenshot, open app, volume, timer, simple file ops) without ever calling an LLM for classification when the heuristic pre-filter is confident.
+3. Complexity classifier correctly returns `NEEDS_APPROVAL` for a deep research request, and MAX asks the approval question before doing anything else.
+4. Declining the approval question falls back cleanly to the existing Normal Research pipeline, unchanged.
+5. Approving triggers Orchestrator, which visibly creates a task_id and Blackboard entries (verify by direct SQLite inspection during a manual test run).
+6. Mid-task "what's the status" query returns a correct, fast, non-blocking answer while sub-agents are still running.
+7. A genuinely new/unrelated query issued mid-task is handled without breaking the in-progress task.
+8. Simulate a sub-agent failure (e.g., force a bad URL into scrape_agent) and verify: one auto-retry happens, then user is notified, and all three Case 1/2/3 user response patterns from Section 5.2 are handled correctly.
+9. Simulate hitting a Groq rate limit on one key and verify Resource Manager rotates to another key rather than failing the task.
+10. Run a real Deep Research task end-to-end and confirm: multiple search/scrape/evaluate rounds actually occur (not just one pass), the persistent browser tab conversation maintains context across rounds (verify manually by reading the DOM conversation), and the final output file is measurably deeper/more comprehensive than what Normal Research produces for the same topic.
+11. Confirm total wall-clock time for a Deep Research run is NOT artificially padded — every second spent should correspond to a real search/scrape/evaluate/reason action, verifiable via Blackboard timestamps.
+
+---
+
+## 12. Explicitly Parked for a Future Document
+
+- **Coding Worker sub-agent**: high-level shape only — MAX will call sub-agents that open browser tabs to Claude/Gemini/etc. to generate code, test it, and deliver a finished folder. Full flow, file structure, and testing strategy TBD once Sanket finalizes the detailed design. Do NOT attempt to build this now — only ensure the agent-registry extension point (Section 10) makes it easy to slot in later.
+- **Plug-and-Play Skill Ingestion pillar** (auto-learn new skills from a repo link / script / voice command).
+- **Full Self-Correction pillar** (alternate-route-finding beyond the basic retry/ask-user/skip rules already specified in Section 5).
+
+---
+
+*End of document. This plan is considered complete and implementation-ready for the Orchestrator Core + Blackboard + Deep Research Mode scope only. Any ambiguity encountered during implementation that is not resolved by this document should be raised back to Sanket rather than assumed.*
