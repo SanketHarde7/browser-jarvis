@@ -1,21 +1,16 @@
 # Path: backend/modules/orchestrator.py
-# Use: Orchestrator core, complexity gate, roadmap dispatch, and Deep Research mode.
-import asyncio, re, uuid
+# Use: Dynamic Orchestrator — a Master AI in the browser drives every decision.
+#      No hardcoded pipeline. The Master AI issues ACTIONs, the orchestrator executes them.
+import asyncio, logging, re, uuid
 from typing import Any, Dict, List
 from modules.blackboard import blackboard
-from modules.resource_manager import resource_manager
-from modules.agents import search_agent, scrape_agent, evaluate_agent, browser_reasoning_agent, writer_agent
+from modules.agents import search_agent, scrape_agent, master_orchestrator_agent, ai_delegate_agent, writer_agent
 
+logger = logging.getLogger("MAX.ORCHESTRATOR")
 DIRECT = "DIRECT"
 NEEDS_APPROVAL = "NEEDS_APPROVAL"
-AGENT_REGISTRY = {
-    "search_agent": search_agent.run,
-    "scrape_agent": scrape_agent.run,
-    "evaluate_agent": evaluate_agent.run,
-    "browser_reasoning_agent": browser_reasoning_agent.run,
-    "writer_agent": writer_agent.run,
-}
-_COMPLEX_PATTERNS = [r"\bdeep research\b", r"\bresearch .* thoroughly\b", r"\bcompare\b.*\b(across|sources|websites)\b", r"\bkeep digging\b", r"\bfull understanding\b", r"\bbuild and test\b", r"\bcomprehensive\b", r"\buntil .* accurate\b"]
+
+_COMPLEX_PATTERNS = [r"\bresearch\b", r"\bdeep research\b", r"\bresearch .* thoroughly\b", r"\bcompare\b.*\b(across|sources|websites)\b", r"\bkeep digging\b", r"\bfull understanding\b", r"\bbuild and test\b", r"\bcomprehensive\b", r"\buntil .* accurate\b", r"\bstudy\b.*\bdeeply\b"]
 _DIRECT_PATTERNS = [r"\b(open|close|timer|volume|brightness|screenshot|read screen|play|pause|note|weather|time)\b"]
 _APPROVAL_YES = {"yes","deep","orchestrator","go deep","use orchestrator","haan","ha","ok","okay","kar do","approve"}
 _APPROVAL_NO = {"no","normal","direct","nahi","mat karo","best effort"}
@@ -58,73 +53,192 @@ def cancel_task(task_id: str = None) -> str:
         if task: task.cancel()
     return "Task cancelled, sir."
 
-def build_deep_research_roadmap(query: str, task_id: str) -> Dict[str, Any]:
-    return {"task_id": task_id, "goal": query, "steps": [{"step_id":"s1","agent":"search_agent","depends_on":[],"input_spec":query,"output_spec":"candidate_urls[]","parallel_group":None}], "stopping_condition":"coverage_based", "max_iterations_safety_cap":8}
 
-async def _execute_step(task_id: str, step: Dict[str, Any], context: Dict[str, Any]):
-    blackboard.update_step(task_id, step["step_id"], "running")
-    try:
-        agent = AGENT_REGISTRY[step["agent"]]
-        output = await agent(step.get("input_data") or step, context)
-        blackboard.update_step(task_id, step["step_id"], "success", output)
-    except Exception as e:
-        # one automatic retry for transient-like failures
-        try:
-            await asyncio.sleep(1)
-            output = await AGENT_REGISTRY[step["agent"]](step.get("input_data") or step, context)
-            blackboard.update_step(task_id, step["step_id"], "success", output)
-        except Exception as e2:
-            blackboard.update_step(task_id, step["step_id"], "failed", {}, str(e2 or e))
-    finally:
-        await resource_manager.release()
+async def run_orchestrator(query: str, conversation_context: str = "", task_id: str = None, notify_callback=None) -> Dict[str, Any]:
+    """
+    Dynamic Orchestrator Loop.
 
-async def run_orchestrator(query: str, conversation_context: str = "", task_id: str = None) -> Dict[str, Any]:
+    A Master AI (running in a persistent browser tab) decides every move.
+    This loop simply:
+      1. Asks the Master AI for the next ACTION
+      2. Executes it (SEARCH, READ_URL, ASK_AI)
+      3. Feeds the result back to the Master AI
+      4. Repeats until FINISH
+    """
     task_id = task_id or str(uuid.uuid4())
-    roadmap = build_deep_research_roadmap(query, task_id)
-    blackboard.init_task(task_id, roadmap)
+    blackboard.init_task(task_id, {"task_id": task_id, "goal": query, "steps": [], "stopping_condition": "dynamic", "max_iterations_safety_cap": 20})
     _running_tasks[task_id] = asyncio.current_task()
-    context={"goal": query, "conversation_context": conversation_context}
-    evaluations=[]; iteration=1; max_iter=roadmap["max_iterations_safety_cap"]
+    context = {"goal": query, "conversation_context": conversation_context, "task_id": task_id}
+
+    max_turns = 20  # Safety cap
+    collected_evidence: List[Dict[str, Any]] = []  # Fallback data for writer
+
     try:
-        while iteration <= max_iter:
-            # run ready roadmap steps
-            while True:
-                ready = await resource_manager.filter_by_capacity(blackboard.get_ready_steps(task_id))
-                if not ready: break
-                await asyncio.gather(*[_execute_step(task_id, s, context) for s in ready])
-            steps = blackboard.get_task_steps(task_id)
-            searches=[s for s in steps if s["agent_name"]=="search_agent" and s["status"]=="success"]
-            urls=[]
-            for s in searches: urls += s["output_data"].get("candidate_urls", [])[:5]
-            existing={s["input_data"].get("url") for s in steps if s["agent_name"]=="scrape_agent"}
-            new_urls=[u for u in urls if u not in existing][:8]
-            if new_urls:
-                for i,u in enumerate(new_urls): blackboard.create_step(task_id, f"scrape_{iteration}_{i}", "scrape_agent", [], {"url":u})
-                continue
-            scrapes=[s for s in blackboard.get_task_steps(task_id) if s["agent_name"]=="scrape_agent" and s["status"]=="success"]
-            evaluated={s["input_data"].get("url") for s in steps if s["agent_name"]=="evaluate_agent"}
-            new_scrapes=[s for s in scrapes if s["output_data"].get("url") not in evaluated]
-            if new_scrapes:
-                for i,s in enumerate(new_scrapes): blackboard.create_step(task_id, f"eval_{iteration}_{i}", "evaluate_agent", [], {"url":s["output_data"].get("url"), "raw_text":s["output_data"].get("raw_text"), "question":query})
-                continue
-            evaluations=[s["output_data"] for s in blackboard.get_task_steps(task_id) if s["agent_name"]=="evaluate_agent" and s["status"]=="success" and s["output_data"].get("is_useful")]
-            reason = await browser_reasoning_agent.run({"goal":query,"facts":[e.get("extracted_facts","") for e in evaluations],"iteration":iteration}, context)
-            blackboard.create_step(task_id, f"reason_{iteration}", "browser_reasoning_agent", [], {"iteration":iteration})
-            blackboard.update_step(task_id, f"reason_{iteration}", "success", reason)
-            if reason.get("sufficient") or iteration >= max_iter:
-                out = await writer_agent.run({"goal":query,"evaluations":evaluations}, context)
-                blackboard.create_step(task_id, "writer", "writer_agent", [], {"goal":query})
-                blackboard.update_step(task_id, "writer", "success", out)
-                return {"task_id":task_id, "response": out.get("message"), "file_path": out.get("file_path")}
-            for i,nq in enumerate(reason.get("next_search_queries", [])):
-                blackboard.create_step(task_id, f"search_{iteration}_{i}", "search_agent", [], {"query":nq, "max_results":8})
+        # ── Turn 1: Initialize the Master AI ──
+        master_input = {"goal": query, "iteration": 1}
+        action_data = await master_orchestrator_agent.run(master_input, context)
+        blackboard.create_step(task_id, "master_turn_1", "master_orchestrator_agent", [], {"iteration": 1})
+        blackboard.update_step(task_id, "master_turn_1", "success", action_data)
+
+        iteration = 2
+
+        while iteration <= max_turns:
+            action = action_data.get("action", "FINISH")
+            thinking = action_data.get("thinking", "")
+            logger.info(f"🎯 Turn {iteration-1} | Action: {action} | Thinking: {thinking}")
+
+            # ── Execute the ACTION ──
+            if action == "FINISH":
+                logger.info("🏁 Master AI called FINISH. Starting report generation...")
+                break
+
+            elif action == "SEARCH":
+                search_query = action_data.get("query", query)
+                logger.info(f"🔍 Executing SEARCH: {search_query}")
+                step_id = f"search_{iteration}"
+
+                try:
+                    result = await search_agent.run({"query": search_query, "max_results": 8}, context)
+                    urls = result.get("candidate_urls", [])
+                    blackboard.create_step(task_id, step_id, "search_agent", [], {"query": search_query})
+                    blackboard.update_step(task_id, step_id, "success", result)
+
+                    if urls:
+                        result_text = f"Found {len(urls)} URLs:\n" + "\n".join(f"  {i+1}. {u}" for i, u in enumerate(urls[:8]))
+                    else:
+                        result_text = "Search returned no results. Try a different query or use ASK_AI."
+
+                    master_input = {
+                        "goal": query, "iteration": iteration,
+                        "action_type": "SEARCH", "action_result": result_text,
+                    }
+                except Exception as e:
+                    logger.error(f"Search failed: {e}")
+                    blackboard.create_step(task_id, step_id, "search_agent", [], {"query": search_query})
+                    blackboard.update_step(task_id, step_id, "failed", {}, str(e))
+
+                    master_input = {
+                        "goal": query, "iteration": iteration,
+                        "action_type": "SEARCH", "action_error": str(e),
+                    }
+
+            elif action == "READ_URL":
+                url = action_data.get("url", "")
+                logger.info(f"📖 Executing READ_URL: {url}")
+                step_id = f"read_{iteration}"
+
+                try:
+                    result = await scrape_agent.run({"url": url}, context)
+                    raw_text = result.get("raw_text", "")
+                    blackboard.create_step(task_id, step_id, "scrape_agent", [], {"url": url})
+                    blackboard.update_step(task_id, step_id, "success", result)
+
+                    if raw_text:
+                        # Store for writer fallback
+                        collected_evidence.append({"url": url, "text": raw_text[:3000]})
+                        # Send truncated text to Master AI
+                        result_text = f"Content from {url} ({len(raw_text)} chars total):\n\n{raw_text[:12000]}"
+                    else:
+                        result_text = f"Could not extract text from {url}. The page may be blocked or empty."
+
+                    master_input = {
+                        "goal": query, "iteration": iteration,
+                        "action_type": "READ_URL", "action_result": result_text,
+                    }
+                except Exception as e:
+                    logger.error(f"Read URL failed: {e}")
+                    blackboard.create_step(task_id, step_id, "scrape_agent", [], {"url": url})
+                    blackboard.update_step(task_id, step_id, "failed", {}, str(e))
+
+                    master_input = {
+                        "goal": query, "iteration": iteration,
+                        "action_type": "READ_URL", "action_error": f"Failed to read {url}: {e}",
+                    }
+
+            elif action == "ASK_AI":
+                platform = action_data.get("platform", "perplexity")
+                ai_prompt = action_data.get("prompt", query)
+                logger.info(f"🤖 Executing ASK_AI on {platform}: {ai_prompt[:80]}...")
+                step_id = f"ask_ai_{iteration}"
+
+                try:
+                    result = await ai_delegate_agent.run({"platform": platform, "prompt": ai_prompt}, context)
+                    blackboard.create_step(task_id, step_id, "ai_delegate_agent", [], {"platform": platform})
+                    blackboard.update_step(task_id, step_id, "success", result)
+
+                    if result.get("success"):
+                        answer = result.get("answer", "")
+                        collected_evidence.append({"url": f"AI:{platform}", "text": answer[:3000]})
+                        result_text = f"Answer from {platform.title()}:\n\n{answer[:12000]}"
+                    else:
+                        result_text = f"ASK_AI failed: {result.get('error', 'unknown error')}"
+
+                    master_input = {
+                        "goal": query, "iteration": iteration,
+                        "action_type": "ASK_AI", "action_result": result_text,
+                    }
+                except Exception as e:
+                    logger.error(f"ASK_AI failed: {e}")
+                    blackboard.create_step(task_id, step_id, "ai_delegate_agent", [], {"platform": platform})
+                    blackboard.update_step(task_id, step_id, "failed", {}, str(e))
+
+                    master_input = {
+                        "goal": query, "iteration": iteration,
+                        "action_type": "ASK_AI", "action_error": str(e),
+                    }
+
+            else:
+                logger.warning(f"Unknown action: {action}. Asking Master AI to clarify.")
+                master_input = {
+                    "goal": query, "iteration": iteration,
+                    "action_type": action, "action_error": f"Unknown action '{action}'. Use SEARCH, READ_URL, ASK_AI, or FINISH.",
+                }
+
+            # ── Ask Master AI for the next ACTION ──
+            action_data = await master_orchestrator_agent.run(master_input, context)
+            blackboard.create_step(task_id, f"master_turn_{iteration}", "master_orchestrator_agent", [], {"iteration": iteration})
+            blackboard.update_step(task_id, f"master_turn_{iteration}", "success", action_data)
             iteration += 1
-        return {"task_id":task_id, "response":"Deep task stopped at safety cap.", "file_path":None}
+
+        # ── FINISH: Generate the report ──
+        logger.info("✍️ Triggering Writer Agent for final report...")
+
+        # Build evaluations list from collected evidence for writer fallback
+        evaluations = []
+        for ev in collected_evidence:
+            evaluations.append({
+                "url": ev.get("url", "unknown"),
+                "is_useful": True,
+                "extracted_facts": ev.get("text", ""),
+                "relevance_note": "Collected by Master Orchestrator",
+            })
+
+        out = await writer_agent.run({"goal": query, "evaluations": evaluations}, context)
+        blackboard.create_step(task_id, "writer", "writer_agent", [], {"goal": query})
+        blackboard.update_step(task_id, "writer", "success", out)
+
+        result = {"task_id": task_id, "response": out.get("message"), "file_path": out.get("file_path")}
+
+        if notify_callback:
+            try:
+                await notify_callback(f"Sir, the deep research on '{query}' is complete. The report has been saved.")
+            except Exception as ne:
+                logger.warning(f"Notification callback failed: {ne}")
+
+        return result
+
+    except asyncio.CancelledError:
+        logger.info(f"Task {task_id} was cancelled.")
+        return {"task_id": task_id, "response": "Deep research task was cancelled.", "file_path": None}
+    except Exception as e:
+        logger.error(f"Orchestrator fatal error: {e}", exc_info=True)
+        return {"task_id": task_id, "response": f"Deep research failed: {e}", "file_path": None}
     finally:
         _running_tasks.pop(task_id, None)
 
-def start_orchestrator_background(query: str, context: str = "") -> str:
+
+def start_orchestrator_background(query: str, context: str = "", notify_callback=None) -> str:
     task_id = str(uuid.uuid4())
-    task = asyncio.create_task(run_orchestrator(query, context, task_id))
+    task = asyncio.create_task(run_orchestrator(query, context, task_id, notify_callback=notify_callback))
     _running_tasks[task_id]=task
     return task_id
