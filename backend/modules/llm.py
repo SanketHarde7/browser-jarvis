@@ -158,7 +158,7 @@ DECISION GUIDE
   Example: "Count to 100" -> "Sure! [SKILL:count:1:100:false]"
   Example: "Count from 50 to 10" -> "Okay! [SKILL:count:50:10:true]"
 - Real-time data? -> search
-- Research/deep dive? -> research. If MAX has already asked about Orchestrator approval, respect that external routing; do not invent multi-agent behavior inside one skill tag.
+- Research/deep dive? -> Do NOT use any skill tag. Just reply with a natural acknowledgment. The Orchestrator handles research externally.
 - Play song/video? -> youtube_play
 - Pause/skip media? -> media skill
 - Open/control PC? -> appropriate skill
@@ -213,14 +213,12 @@ DECISION GUIDE
 - "Take a screenshot and send to someone on WhatsApp" -> ALWAYS use format: [SKILL:whatsapp_screenshot:<Contact_Name>]
   Example: "Send screenshot to Aditya" -> [SKILL:whatsapp_screenshot:Aditya]
   
--important :Rule: If the user explicitly asks to conduct 'deep research', 'create a research report', or 'study a topic deeply',
-you MUST trigger the deep_research skill. Format: [SKILL:deep_research:<topic_name>:<ai_platform>] (ai_platform is optional, defaults to gemini).
+- IMPORTANT: If the user asks for 'deep research', 'research report', or 'study a topic deeply',
+  do NOT use any skill tag. Just reply naturally with an acknowledgment. The Orchestrator system handles research externally.
 
 - Schedule a task/action -> [SKILL:schedule_action:YYYY-MM-DD:HH:MM:<skill_name>:<param1>:<param2>...]
   CRITICAL: Time MUST be in 24-hour format. Use the correct skill_name for the action.
-  Example 1: "Schedule research on tokenizers for tomorrow at 10 AM"
-  -> [SKILL:schedule_action:2026-06-10:10:00:deep_research:tokenizers:gemini]
-  Example 2: "Send WhatsApp to Aditya tonight at 8 PM saying script is ready"
+  Example: "Send WhatsApp to Aditya tonight at 8 PM saying script is ready"
   -> [SKILL:schedule_action:2026-06-09:20:00:whatsapp_message:Aditya:script is ready]
 
   
