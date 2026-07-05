@@ -640,34 +640,29 @@ class SkillsEngine:
 
     def _skill_deep_research(self, topic: str = "", ai_platform: str = "gemini") -> str:
         """
-        Executes a deep autonomous research on a given topic using the specified AI platform.
+        Executes a deep autonomous research on a given topic.
+        Now routes through the new Dynamic Master Orchestrator instead of the old broken agent.
         Usage from intent: [SKILL:deep_research:Black Holes:gemini]
         """
         if not topic:
             return "Please provide a topic for research."
 
         topic = topic.strip()
-        ai_platform = ai_platform.strip().lower()
-        
+
         try:
-            from modules.ai_orchestrator.research_agent import DeepResearchAgent
-            
+            from modules.orchestrator import start_orchestrator_background
+
             logger = logging.getLogger("MAX.SKILLS.DEEP_RESEARCH")
-            logger.info(f"Triggering Deep Research Agent for topic: '{topic}' via {ai_platform}")
-            
-            # Use existing class config instead of creating a new one
-            research_agent = DeepResearchAgent(self.config)
-            
-            # Run the autonomous process
-            research_agent.run_research(topic=topic, urls_to_crawl=[], ai_platform=ai_platform)
-            
-            # Final TTS success message
-            success_message = f"Sir, the deep research on {topic} is complete. The formatted report has been generated and saved to the Jarvis Generated Research folder on your desktop."
-            return success_message
+            logger.info(f"Routing deep research to Master Orchestrator for topic: '{topic}'")
+
+            # Start the orchestrator in background — it handles everything dynamically
+            task_id = start_orchestrator_background(topic)
+
+            return f"Deep research on '{topic}' has been started in the background using the Master Orchestrator. Task ID: {task_id}. You can ask for status anytime."
 
         except Exception as e:
             logger.error(f"Deep Research Skill Failed: {e}")
-            return f"Sorry sir, I encountered an error while researching {topic}. Please check the system logs."
+            return f"Sorry sir, I encountered an error while starting research on {topic}. Please check the system logs."
     
     
     def _skill_web_search(self, *args) -> str:
