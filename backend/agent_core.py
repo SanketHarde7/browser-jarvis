@@ -229,7 +229,7 @@ class MaxAgent:
 
             # 🧠 ORCHESTRATOR APPROVAL GATE — after Ghost Mode, before normal LLM routing.
             lowered = text.lower().strip()
-            if any(p in lowered for p in ["what's the status", "what is the status", "status kya", "kya chal raha", "what is happening"]):
+            if any(p in lowered for p in ["status", "what's the status", "what is the status", "status kya", "kya chal raha", "what is happening"]):
                 status_text = get_status_summary()
                 if use_tts and status_text:
                     tts_path = await generate_tts(self.gatekeeper.filter_for_tts(status_text))
@@ -246,9 +246,24 @@ class MaxAgent:
             if pending:
                 approval = approval_reply_kind(text)
                 if approval == "yes":
-                    task_id = start_orchestrator_background(pending.get("query", text), pending.get("context", combined_context))
+                    async def _orchestrator_done_notify(msg: str):
+                        """Called by orchestrator when background task completes."""
+                        try:
+                            audio = await generate_tts(self.gatekeeper.filter_for_tts(msg))
+                            if audio:
+                                print(f"🔔 [ORCHESTRATOR NOTIFY] {msg}")
+                                # Audio will be picked up by the frontend via the normal TTS path
+                        except Exception as e:
+                            print(f"🔴 [ORCHESTRATOR NOTIFY ERROR] {e}")
+
+                    task_id = start_orchestrator_background(
+                        pending.get("query", text),
+                        pending.get("context", combined_context),
+                        notify_callback=_orchestrator_done_notify,
+                    )
                     response = f"Deep Orchestrator started. Task ID: {task_id}. You can ask for status anytime."
-                    tts_path = await generate_tts(self.gatekeeper.filter_for_tts(response)) if use_tts else ""
+                    tts_response = "Deep Orchestrator started. You can ask for status anytime."
+                    tts_path = await generate_tts(self.gatekeeper.filter_for_tts(tts_response)) if use_tts else ""
                     return {"response": response, "tts_path": tts_path, "skill_used": "orchestrator", "intent": "orchestrator_started", "task_id": task_id}
                 if approval == "no":
                     text = pending.get("query", text)
