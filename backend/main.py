@@ -25,7 +25,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from config import config
-from agent_core import get_agent, set_websocket_globals
+from agent_core import get_agent, register_websocket
 from modules.stt import transcribe_audio, transcribe_file, transcribe_wake_word, is_valid_transcript
 from modules.tts import generate_tts
 from modules.llm import get_greeting
@@ -48,14 +48,17 @@ main_loop: Optional[asyncio.AbstractEventLoop] = None
 health_buddy_instance: Optional[HealthBuddy] = None
 
 def send_health_buddy_alert(payload):
-    global active_websocket, main_loop
-    if active_websocket and main_loop:
+    from agent_core import get_active_websockets, get_main_loop
+    ws_list = get_active_websockets()
+    loop = get_main_loop()
+    if ws_list and loop:
         async def _send():
-            try:
-                await active_websocket.send_json(payload)
-            except Exception as e:
-                logger.warning(f"Failed to stream health alert: {e}")
-        asyncio.run_coroutine_threadsafe(_send(), main_loop)
+            for ws in list(ws_list):
+                try:
+                    await ws.send_json(payload)
+                except Exception as e:
+                    logger.warning(f"Failed to stream health alert: {e}")
+        asyncio.run_coroutine_threadsafe(_send(), loop)
 
 # ═══════════════════════════════════════════════════
 # LOGGING
@@ -123,12 +126,20 @@ async def _on_startup():
     #     logger.warning(f"Health Buddy start failed: {e}")
 
 
+zeroconf_instance = None
+
 @app.on_event("shutdown")
 async def _on_shutdown():
-    global health_buddy_instance
+    global health_buddy_instance, zeroconf_instance
     if health_buddy_instance:
         health_buddy_instance.stop()
         logger.info("Health Buddy stopped")
+    if zeroconf_instance:
+        try:
+            zeroconf_instance.close()
+            logger.info("mDNS zeroconf stopped")
+        except Exception:
+            pass
 
 
 @app.on_event("startup")
@@ -138,6 +149,35 @@ async def startup_event():
         logger.info("Knowledge index ready.")
     except Exception as e:
         logger.warning(f"Knowledge index startup failed: {e}")
+        
+    try:
+        from zeroconf import ServiceInfo, Zeroconf
+        import socket
+        global zeroconf_instance
+        
+        # We need the local IP address for the service
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(("8.8.8.8", 80))
+            local_ip = s.getsockname()[0]
+        except Exception:
+            local_ip = "127.0.0.1"
+        finally:
+            s.close()
+            
+        info = ServiceInfo(
+            "_http._tcp.local.",
+            "max-server._http._tcp.local.",
+            addresses=[socket.inet_aton(local_ip)],
+            port=8000,
+            properties={"version": "4.2.0"},
+            server="max-server.local."
+        )
+        zeroconf_instance = Zeroconf()
+        zeroconf_instance.register_service(info)
+        logger.info(f"mDNS broadcast started: max-server.local -> {local_ip}:8000")
+    except Exception as e:
+        logger.warning(f"mDNS zeroconf failed to start: {e}")
 
 
 # ═══════════════════════════════════════════════════
@@ -458,12 +498,12 @@ async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     logger.info(f"Client connected: {websocket.client}")
 
-    global active_websocket, main_loop
-    active_websocket = websocket
+    global main_loop
     main_loop = asyncio.get_running_loop()
     
     # Register globals in agent_core so acknowledgements can be sent
-    set_websocket_globals(active_websocket, main_loop)
+    from agent_core import register_websocket, unregister_websocket
+    register_websocket(websocket, main_loop)
 
     connection_state = {
         "active_task": None,
@@ -740,10 +780,11 @@ async def websocket_endpoint(websocket: WebSocket):
         except Exception:
             pass
     finally:
-        if active_websocket == websocket:
-            active_websocket = None
-
-
+        try:
+            from agent_core import unregister_websocket
+            unregister_websocket(websocket)
+        except Exception:
+            pass
 # ═══════════════════════════════════════════════════
 # HEALTH & SYSTEM
 # ═══════════════════════════════════════════════════
