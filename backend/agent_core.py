@@ -23,17 +23,30 @@ from modules.orchestrator import (
 logger = logging.getLogger("MAX.AGENT")
 
 # Global WebSocket reference set by main.py at startup
-_active_websocket = None
+_active_websockets = set()
 _main_event_loop = None
+active_device = "laptop"
 
-def set_websocket_globals(websocket, loop):
+def register_websocket(websocket, loop):
     """Called by main.py on WebSocket connection to set globals."""
-    global _active_websocket, _main_event_loop
-    _active_websocket = websocket
+    global _active_websockets, _main_event_loop
+    _active_websockets.add(websocket)
     _main_event_loop = loop
 
-def get_active_websocket():
-    return _active_websocket
+def unregister_websocket(websocket):
+    global _active_websockets
+    _active_websockets.discard(websocket)
+
+def get_active_websockets():
+    return _active_websockets
+
+def get_active_device():
+    global active_device
+    return active_device
+
+def set_active_device(device: str):
+    global active_device
+    active_device = device
 
 def get_main_loop():
     return _main_event_loop
@@ -92,45 +105,45 @@ class MaxAgent:
             logger.debug(f"Reminder scheduler not available: {e}")
 
     async def _send_ack_via_websocket(self, ack_text: str, use_tts: bool):
-        global _active_websocket, _main_event_loop
+        global _active_websockets, _main_event_loop
         if not ack_text or not ack_text.strip():
             return
+        if not _active_websockets or not _main_event_loop:
+            return  
+        
         try:
-            ws = _active_websocket
-            loop = _main_event_loop
-            if not ws or not loop:
-                return  
-            
-            try:
-                # ONLY send audio for acknowledgement, do not print on screen.
-                if use_tts:
-                    import os
-                    import base64
-                    tts_path = await generate_tts(ack_text)
-                    if tts_path and os.path.exists(tts_path):
-                        with open(tts_path, "rb") as f:
-                            encoded_audio = base64.b64encode(f.read()).decode('utf-8')
-                            await ws.send_json({"event": "audio_response", "audio": encoded_audio})
+            # ONLY send audio for acknowledgement, do not print on screen.
+            if use_tts:
+                import os
+                import base64
+                tts_path = await generate_tts(ack_text)
+                if tts_path and os.path.exists(tts_path):
+                    with open(tts_path, "rb") as f:
+                        encoded_audio = base64.b64encode(f.read()).decode('utf-8')
+                        
+                    for ws in list(_active_websockets):
                         try:
-                            os.remove(tts_path)
+                            await ws.send_json({"event": "audio_response", "audio": encoded_audio})
                         except Exception:
                             pass
-            except Exception as e:
-                logger.debug(f"Ack text/audio send failed: {e}")
-                return  
+                    try:
+                        os.remove(tts_path)
+                    except Exception:
+                        pass
         except Exception as e:
-            logger.debug(f"Ack dispatch failed: {e}")
+            logger.debug(f"Ack text/audio send failed: {e}")
+            return  
 
     async def _send_event_via_websocket(self, payload: dict):
         """Push an additive event (plan_update etc.) to the client. Never raises."""
-        global _active_websocket
-        ws = _active_websocket
-        if not ws:
+        global _active_websockets
+        if not _active_websockets:
             return
-        try:
-            await ws.send_json(payload)
-        except Exception as e:
-            logger.debug(f"Event send failed: {e}")
+        for ws in list(_active_websockets):
+            try:
+                await ws.send_json(payload)
+            except Exception:
+                pass
 
     async def process_text_input(self, text: str, use_tts: bool = True, input_source: str = "unknown") -> Dict[str, Any]:
         print(f"\n🟢 [TRACKER: 1] Pipeline started! Input: '{text}' | Source: {input_source}")
@@ -140,6 +153,24 @@ class MaxAgent:
             return {"response": "", "tts_path": "", "skill_used": None, "intent": "empty"}
         
         try:
+            # 🚨 0. DEVICE SWITCHING INTERCEPT
+            text_lower = text.lower().strip()
+            if any(phrase in text_lower for phrase in ["phone pe aa ja", "switch to phone", "connect to phone", "transfer to phone", "switch to mobile", "come in mobile", "mobile pe aa ja", "come to mobile"]):
+                print("📱 [TRACKER] Switching active device to PHONE")
+                set_active_device("phone")
+                await self._send_event_via_websocket({"event": "SWITCH_ACTIVE", "device": "phone"})
+                msg = "Control transferred to phone."
+                tts_path = await generate_tts(msg) if use_tts else ""
+                return {"response": msg, "tts_path": tts_path, "skill_used": None, "intent": "device_switch"}
+            
+            if any(phrase in text_lower for phrase in ["laptop pe wapas", "switch to laptop", "connect to laptop", "transfer to laptop", "pc pe wapas", "switch to pc", "come to pc", "laptop pe aa ja", "come in laptop", "pc pe aa ja", "come to laptop"]):
+                print("💻 [TRACKER] Switching active device to LAPTOP")
+                set_active_device("laptop")
+                await self._send_event_via_websocket({"event": "SWITCH_ACTIVE", "device": "laptop"})
+                msg = "Control transferred to laptop."
+                tts_path = await generate_tts(msg) if use_tts else ""
+                return {"response": msg, "tts_path": tts_path, "skill_used": None, "intent": "device_switch"}
+
             # 🚨 1. GHOST MODE INTERACTION BYPASS
             print("🟢 [TRACKER: 2] Checking Ghost Mode...")
             ghost_result = await self.process_ghost_mode_test(text)
