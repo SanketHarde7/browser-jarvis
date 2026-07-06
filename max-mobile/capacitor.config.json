@@ -1,0 +1,8 @@
+{
+  "appId": "com.jarvis.maxmobile",
+  "appName": "max-mobile",
+  "webDir": "dist",
+  "server": {
+    "androidScheme": "http"
+  }
+}
