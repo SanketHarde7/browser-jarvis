@@ -10,11 +10,11 @@ import { motion, AnimatePresence } from 'framer-motion'
 
 // Components
 import BootSequence from './components/BootSequence.jsx'
-import ErrorBoundary from './components/ErrorBoundary'
 import BackgroundEngine from './components/BackgroundEngine'
-import TypingInput from './components/TypingInput.jsx'
+import InputBar from './components/InputBar.jsx'
 import OrbCore from './components/OrbCore.jsx'
 import WaveVisualizer from './components/WaveVisualizer.jsx'
+import { Settings } from 'lucide-react'
 import ChatPanel from './components/ChatPanel.jsx'
 // Hooks
 import { useWebSocket } from './hooks/useWebSocket.js'
@@ -41,7 +41,6 @@ function App() {
   const [jarvisState, setMaxState] = useState('idle')
   const [messages, setMessages] = useState([])
   const [error, setError] = useState(null)
-  const [chatOpen, setChatOpen] = useState(true)
   const [continuousListening, setContinuousListening] = useState(false)
   const [serverUrl, setServerUrl] = useState(() => localStorage.getItem("max_server_url") || "10.127.214.90:8000")
   const [showSettings, setShowSettings] = useState(false)
@@ -362,330 +361,158 @@ function App() {
     }
   }
 
-  // ── Clear Chat ──
-  const handleClearChat = async () => {
-    setMessages([])
-    try {
-      await fetch('http://localhost:8000/api/memory', { method: 'DELETE' })
-    } catch (e) {
-      console.warn('Memory clear failed:', e)
-    }
-  }
-
-  // ── Skill Chip Handler ──
-  const handleSkillSelect = (text) => {
-    handleSendText(text)
-  }
-
   // ── Boot Screen ──
   if (booting) {
     return <BootSequence onComplete={() => setBooting(false)} />
   }
 
-  // ── Mic Button Colors ──
-  const micColors = {
-    idle: {
-      bg: 'linear-gradient(135deg, #00d4ff 0%, #0099cc 100%)',
-      shadow: '0 0 30px rgba(0, 212, 255, 0.35)',
-      text: '#050a0f',
-    },
-    listening: {
-      bg: 'linear-gradient(135deg, #00ff88 0%, #00cc6a 100%)',
-      shadow: '0 0 40px rgba(0, 255, 136, 0.5)',
-      text: '#050a0f',
-    },
-    thinking: {
-      bg: 'linear-gradient(135deg, #ffd700 0%, #cc9900 100%)',
-      shadow: '0 0 30px rgba(255, 215, 0, 0.3)',
-      text: '#050a0f',
-    },
-    speaking: {
-      bg: 'rgba(255, 58, 138, 0.2)',
-      shadow: '0 0 20px rgba(255, 58, 138, 0.2)',
-      text: '#ff3a8a',
-    },
+  const isInputDisabled = jarvisState === 'thinking' || jarvisState === 'speaking' || jarvisState === 'transferred'
+
+  const handleAbort = () => {
+    console.log('🛑 Kill switch triggered via UI')
+    stopAudio()
+    setMaxState('idle')
+    try {
+      const ws = new WebSocket(`ws://${serverUrl}/ws?token=${import.meta.env.VITE_WS_AUTH_TOKEN || ''}`)
+      ws.onopen = () => {
+        ws.send(JSON.stringify({ type: 'abort' }))
+        ws.close()
+      }
+    } catch (err) {
+      console.warn('Could not send abort signal', err)
+    }
   }
-  const micStyle = micColors[jarvisState] || micColors.idle
 
   return (
-    <div
-      style={{
-        width: '100vw',
-        height: '100vh',
-        backgroundColor: '#05070B', // Primary Background from PRD
-        overflow: 'hidden',
-        position: 'relative',
-      }}
-    >
-      {/* 9-Layer Environment Engine */}
+    <div className="max-shell">
       <BackgroundEngine maxState={jarvisState} />
 
-      {/* 3D Scene — Centered Orb */}
-      <div
-        style={{
-          position: 'absolute',
-          top: 0,
-          bottom: 0,
-          left: 0,
-          right: 0,
-          zIndex: 1,
-          display: 'flex',
-          justifyContent: 'center',
-          alignItems: 'center',
-          transition: 'filter 0.5s ease-in-out',
-        }}
-      >
-        <Canvas
-          camera={{ position: [0, 0, 8], fov: 45 }}
-          gl={{ antialias: true, alpha: true }}
-          style={{ background: 'transparent' }}
+      <header className="max-header">
+        <div>
+          <h1 className="max-title">MAX</h1>
+          <p className="max-subtitle">AI that feels alive</p>
+        </div>
+        <button
+          className="max-icon-button glass"
+          type="button"
+          onClick={() => setShowSettings(true)}
+          aria-label="Open settings"
         >
-          <Suspense fallback={null}>
-            <OrbCore state={jarvisState} />
-          </Suspense>
-          <OrbitControls
-            enableZoom={false}
-            enablePan={false}
-            autoRotate
-            autoRotateSpeed={0.3}
-            maxPolarAngle={Math.PI / 1.5}
-            minPolarAngle={Math.PI / 3}
-          />
-        </Canvas>
-      </div>
+          <Settings size={18} strokeWidth={1.8} />
+        </button>
+      </header>
 
-      {/* Circular Waveform Overlay */}
-      <div
-        style={{
-          position: 'absolute',
-          top: '50%',
-          left: chatOpen ? 'calc(50% - 190px)' : '50%',
-          transform: 'translate(-50%, -50%)',
-          width: '500px',
-          height: '500px',
-          zIndex: 2,
-          pointerEvents: 'none',
-          transition: 'left 0.4s cubic-bezier(0.16, 1, 0.3, 1)',
-        }}
-      >
-        <WaveVisualizer
-          isActive={isRecording || isPlaying}
-          mode={jarvisState}
-          analyserNode={analyserNode}
-        />
-      </div>
-
-      {/* Center Status Text + Mic Button */}
-      <div
-        style={{
-          position: 'absolute',
-          bottom: '6rem',
-          left: chatOpen ? 'calc(50% - 190px)' : '50%',
-          transform: 'translateX(-50%)',
-          display: 'flex',
-          flexDirection: 'column',
-          alignItems: 'center',
-          gap: '1.5rem',
-          zIndex: 10,
-          transition: 'left 0.4s cubic-bezier(0.16, 1, 0.3, 1)',
-        }}
-      >
-        {/* State Label */}
-        <AnimatePresence mode="wait">
-          <motion.div
-            key={jarvisState}
-            initial={{ opacity: 0, y: 8 }}
-            animate={{ opacity: 1, y: 0 }}
-            exit={{ opacity: 0, y: -8 }}
-            transition={{ duration: 0.2 }}
-            style={{
-              fontFamily: "'Orbitron', monospace",
-              fontSize: '0.85rem',
-              fontWeight: 600,
-              letterSpacing: '4px',
-              color:
-                jarvisState === 'idle'
-                  ? '#00d4ff'
-                  : jarvisState === 'listening'
-                  ? '#00ff88'
-                  : jarvisState === 'thinking'
-                  ? '#ffd700'
-                  : '#ff3a8a',
-              textShadow: `0 0 20px currentColor`,
-            }}
+      <main className="max-stage">
+        <div className="orb-canvas-wrap" aria-hidden="true">
+          <Canvas
+            camera={{ position: [0, 0, 8], fov: 45 }}
+            gl={{ antialias: true, alpha: true }}
+            style={{ background: 'transparent' }}
           >
-            {jarvisState === 'idle' && '◆ SYSTEM READY'}
-            {jarvisState === 'listening' && '● LISTENING...'}
-            {jarvisState === 'thinking' && '◇ PROCESSING...'}
-            {jarvisState === 'speaking' && '♪ RESPONDING...'}
-          </motion.div>
-        </AnimatePresence>
+            <Suspense fallback={null}>
+              <OrbCore state={jarvisState} />
+            </Suspense>
+            <OrbitControls
+              enableZoom={false}
+              enablePan={false}
+              autoRotate
+              autoRotateSpeed={0.3}
+              maxPolarAngle={Math.PI / 1.5}
+              minPolarAngle={Math.PI / 3}
+            />
+          </Canvas>
+        </div>
 
-        {/* Main Mic Button */}
-        <motion.button
-          id="mic-button"
-          onMouseDown={handleMicPress}
-          onMouseUp={handleMicRelease}
-          onTouchStart={(e) => {
-            e.preventDefault()
-            handleMicPress()
-          }}
-          onTouchEnd={(e) => {
-            e.preventDefault()
-            handleMicRelease()
-          }}
-          whileHover={{ scale: 1.05 }}
-          whileTap={{ scale: 0.92 }}
-          disabled={jarvisState === 'thinking' || jarvisState === 'speaking' || jarvisState === 'transferred'}
-          style={{
-            padding: '1rem 2.8rem',
-            fontSize: '0.9rem',
-            fontWeight: 700,
-            fontFamily: "'Orbitron', monospace",
-            letterSpacing: '3px',
-            background: jarvisState === 'transferred' ? '#222' : micStyle.bg,
-            color: jarvisState === 'transferred' ? '#555' : micStyle.text,
-            border: 'none',
-            borderRadius: '50px',
-            cursor:
-              jarvisState === 'thinking' || jarvisState === 'speaking' || jarvisState === 'transferred'
-                ? 'not-allowed'
-                : 'pointer',
-            boxShadow: jarvisState === 'transferred' ? 'none' : micStyle.shadow,
-            transition: 'all 0.3s ease',
-            opacity:
-              jarvisState === 'thinking' || jarvisState === 'speaking' || jarvisState === 'transferred'
-                ? 0.5
-                : 1,
-            userSelect: 'none',
-            WebkitUserSelect: 'none',
-          }}
-        >
-          {jarvisState === 'transferred'
-            ? '📱 PHONE IS ACTIVE'
-            : isRecording
-            ? '🎙️  RELEASE TO SEND'
-            : jarvisState === 'thinking'
-            ? '⏳  PROCESSING...'
-            : jarvisState === 'speaking'
-            ? '🔊  SPEAKING...'
-            : '🎙️  HOLD TO SPEAK'}
-        </motion.button>
-        
-        {/* Typing Input for Text Commands */}
-        <TypingInput 
-          onSend={handleSendText} 
-          disabled={jarvisState === 'thinking' || jarvisState === 'speaking' || jarvisState === 'transferred'} 
+        <div className="orb-wave-wrap" aria-hidden="true">
+          <WaveVisualizer
+            isActive={isRecording || isPlaying}
+            mode={jarvisState}
+            analyserNode={analyserNode}
+          />
+        </div>
+
+        <ChatPanel
+          messages={messages}
+          isProcessing={jarvisState === 'thinking'}
+          userName="Arjun"
         />
+      </main>
 
-        {/* NEW: Explicit Kill Switch Button */}
+      <div className="bottom-controls">
         <AnimatePresence>
           {(jarvisState === 'thinking' || jarvisState === 'speaking') && (
             <motion.button
-              initial={{ opacity: 0, scale: 0.8 }}
-              animate={{ opacity: 1, scale: 1 }}
-              exit={{ opacity: 0, scale: 0.8 }}
-              onClick={() => {
-                console.log('🛑 Kill switch triggered via UI');
-                stopAudio();
-                setMaxState('idle');
-                try {
-                  const ws = new WebSocket(`ws://${serverUrl}/ws?token=${import.meta.env.VITE_WS_AUTH_TOKEN || ''}`);
-                  ws.onopen = () => {
-                    ws.send(JSON.stringify({ type: 'abort' }));
-                    ws.close();
-                  };
-                } catch (err) {
-                  console.warn('Could not send abort signal', err);
-                }
-              }}
-              style={{
-                marginTop: '10px',
-                padding: '0.6rem 1.5rem',
-                fontSize: '0.8rem',
-                fontWeight: 600,
-                fontFamily: "'Orbitron', monospace",
-                background: 'rgba(255, 58, 58, 0.1)',
-                color: '#ff3a3a',
-                border: '1px solid rgba(255, 58, 58, 0.5)',
-                borderRadius: '8px',
-                cursor: 'pointer',
-                boxShadow: '0 0 10px rgba(255, 58, 58, 0.2)',
-                transition: 'all 0.2s',
-              }}
-              whileHover={{ background: 'rgba(255, 58, 58, 0.2)', scale: 1.05 }}
-              whileTap={{ scale: 0.95 }}
+              className="max-stop-button glass"
+              type="button"
+              initial={{ opacity: 0, y: 8, scale: 0.96 }}
+              animate={{ opacity: 1, y: 0, scale: 1 }}
+              exit={{ opacity: 0, y: 8, scale: 0.96 }}
+              onClick={handleAbort}
             >
-              🛑 STOP MAX
+              Stop MAX
             </motion.button>
           )}
         </AnimatePresence>
+
+        <InputBar
+          onSendText={handleSendText}
+          onSendImage={handleSendImage}
+          onMicPress={handleMicPress}
+          onMicRelease={handleMicRelease}
+          disabled={isInputDisabled}
+          isRecording={isRecording}
+          state={jarvisState}
+        />
       </div>
 
-      {/* Settings Modal */}
+      <AnimatePresence>
+        {error && (
+          <motion.div
+            className="max-error glass"
+            initial={{ opacity: 0, y: -8 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -8 }}
+            role="alert"
+          >
+            {error}
+          </motion.div>
+        )}
+      </AnimatePresence>
+
       <AnimatePresence>
         {showSettings && (
           <motion.div
+            className="settings-backdrop"
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}
-            style={{
-                position: 'fixed',
-                inset: 0,
-                zIndex: 50,
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'center',
-                backgroundColor: 'rgba(0, 0, 0, 0.6)',
-                backdropFilter: 'blur(4px)'
-            }}
           >
             <motion.div
-              initial={{ scale: 0.9 }}
-              animate={{ scale: 1 }}
-              exit={{ scale: 0.9 }}
-              style={{
-                backgroundColor: '#111',
-                border: '1px solid rgba(255,255,255,0.1)',
-                padding: '1.5rem',
-                borderRadius: '1rem',
-                width: '90%',
-                maxWidth: '400px',
-                boxShadow: '0 25px 50px -12px rgba(0, 0, 0, 0.25)'
-              }}
+              className="settings-card glass"
+              initial={{ scale: 0.94, y: 12 }}
+              animate={{ scale: 1, y: 0 }}
+              exit={{ scale: 0.94, y: 12 }}
             >
-              <h2 style={{color: 'white', fontSize: '1.25rem', marginBottom: '1rem', fontWeight: 600}}>Connection Settings</h2>
-              <label style={{color: 'rgba(255,255,255,0.6)', fontSize: '0.875rem', marginBottom: '0.5rem', display: 'block'}}>Backend Server IP:PORT</label>
-              <input 
+              <h2>Connection Settings</h2>
+              <label htmlFor="server-url">Backend Server IP:PORT</label>
+              <input
+                id="server-url"
                 type="text"
                 value={serverUrl}
                 onChange={(e) => setServerUrl(e.target.value)}
-                style={{
-                    width: '100%',
-                    backgroundColor: 'rgba(255,255,255,0.05)',
-                    border: '1px solid rgba(255,255,255,0.1)',
-                    borderRadius: '0.75rem',
-                    padding: '0.75rem',
-                    color: 'white',
-                    marginBottom: '1.5rem',
-                    outline: 'none'
-                }}
                 placeholder="e.g. 192.168.1.100:8000"
               />
-              <div style={{display: 'flex', justifyContent: 'flex-end', gap: '0.75rem'}}>
-                <button 
-                  onClick={() => setShowSettings(false)}
-                  style={{padding: '0.5rem 1rem', borderRadius: '0.75rem', color: 'rgba(255,255,255,0.7)', backgroundColor: 'transparent', border: 'none', cursor: 'pointer'}}
-                >
+              <div className="settings-actions">
+                <button type="button" onClick={() => setShowSettings(false)}>
                   Cancel
                 </button>
-                <button 
+                <button
+                  type="button"
                   onClick={() => {
-                    localStorage.setItem("max_server_url", serverUrl);
-                    setShowSettings(false);
-                    window.location.reload();
+                    localStorage.setItem('max_server_url', serverUrl)
+                    setShowSettings(false)
+                    window.location.reload()
                   }}
-                  style={{padding: '0.5rem 1rem', borderRadius: '0.75rem', backgroundColor: 'rgba(0, 212, 255, 0.2)', color: '#00d4ff', fontWeight: 500, border: 'none', cursor: 'pointer'}}
                 >
                   Save & Reconnect
                 </button>
@@ -694,43 +521,6 @@ function App() {
           </motion.div>
         )}
       </AnimatePresence>
-
-      {/* Settings Button */}
-      <div style={{ position: 'absolute', top: '1rem', right: '1rem', zIndex: 100 }}>
-        <button
-          onClick={() => setShowSettings(true)}
-          style={{
-            background: 'rgba(255, 255, 255, 0.05)',
-            border: '1px solid rgba(255, 255, 255, 0.1)',
-            borderRadius: '50%',
-            width: '40px',
-            height: '40px',
-            cursor: 'pointer',
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            color: '#aaa',
-            fontSize: '1.2rem'
-          }}
-        >
-          ⚙️
-        </button>
-      </div>
-
-      {/* Chat Panel */}
-      <AnimatePresence>
-        {chatOpen && (
-          <ChatPanel
-            messages={messages}
-            isProcessing={jarvisState === 'thinking'}
-            onSendText={handleSendText}
-            onSendImage={handleSendImage} // NEW  
-            onClear={handleClearChat}
-            isVisible={chatOpen}
-          />
-        )}
-      </AnimatePresence>
-
     </div>
   )
 }
