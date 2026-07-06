@@ -133,6 +133,24 @@ function App() {
         case 'pong':
           break
 
+        case 'SWITCH_ACTIVE':
+          if (data.device === 'phone') {
+            setMaxState('transferred')
+            setContinuousListening(false)
+            setMessages((prev) => [
+              ...prev,
+              { role: 'jarvis', content: 'Control transferred to phone. Microphone disabled.' },
+            ])
+            stopAudio()
+          } else if (data.device === 'laptop') {
+             setMaxState('idle')
+             setMessages((prev) => [
+              ...prev,
+              { role: 'jarvis', content: 'Control transferred to laptop. Microphone ready.' },
+            ])
+          }
+          break
+
         default:
           console.log('Unknown WS event:', data)
       }
@@ -544,32 +562,34 @@ function App() {
           }}
           whileHover={{ scale: 1.05 }}
           whileTap={{ scale: 0.92 }}
-          disabled={jarvisState === 'thinking' || jarvisState === 'speaking'}
+          disabled={jarvisState === 'thinking' || jarvisState === 'speaking' || jarvisState === 'transferred'}
           style={{
             padding: '1rem 2.8rem',
             fontSize: '0.9rem',
             fontWeight: 700,
             fontFamily: "'Orbitron', monospace",
             letterSpacing: '3px',
-            background: micStyle.bg,
-            color: micStyle.text,
+            background: jarvisState === 'transferred' ? '#222' : micStyle.bg,
+            color: jarvisState === 'transferred' ? '#555' : micStyle.text,
             border: 'none',
             borderRadius: '50px',
             cursor:
-              jarvisState === 'thinking' || jarvisState === 'speaking'
+              jarvisState === 'thinking' || jarvisState === 'speaking' || jarvisState === 'transferred'
                 ? 'not-allowed'
                 : 'pointer',
-            boxShadow: micStyle.shadow,
+            boxShadow: jarvisState === 'transferred' ? 'none' : micStyle.shadow,
             transition: 'all 0.3s ease',
             opacity:
-              jarvisState === 'thinking' || jarvisState === 'speaking'
+              jarvisState === 'thinking' || jarvisState === 'speaking' || jarvisState === 'transferred'
                 ? 0.5
                 : 1,
             userSelect: 'none',
             WebkitUserSelect: 'none',
           }}
         >
-          {isRecording
+          {jarvisState === 'transferred'
+            ? '📱 PHONE IS ACTIVE'
+            : isRecording
             ? '🔴  RELEASE TO SEND'
             : jarvisState === 'thinking'
             ? '⏳  PROCESSING...'
