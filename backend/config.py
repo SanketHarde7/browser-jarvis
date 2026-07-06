@@ -38,6 +38,7 @@ class Config:
     PORT: int = int(os.getenv("PORT", "8000"))
     SKILLS_ENABLED: bool = True
     COUNTING_PAUSE: float = float(os.getenv("COUNTING_PAUSE", "0.8"))
+    WS_AUTH_TOKEN: str = os.getenv("WS_AUTH_TOKEN", "")
 
     # ── Paths ──
     PROJECT_ROOT: Path = PROJECT_ROOT

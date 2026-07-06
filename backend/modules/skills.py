@@ -423,6 +423,15 @@ class SkillsEngine:
             params_str  = match.group(2) or ""
             params = self._parse_parameters(skill_name, params_str)
 
+            # 🚨 MULTI-DEVICE SECURITY GATE
+            from agent_core import get_active_device
+            if get_active_device() == "phone":
+                # User requested all skills except Orchestrator/Research
+                blocked_mobile_skills = {"orchestrator", "deep_research"}
+                if skill_name in blocked_mobile_skills:
+                    logger.warning(f"Blocked skill execution on phone: {skill_name}")
+                    return {"success": False, "result": "Deep research and orchestrator tasks are restricted on mobile.", "tts_text": "I cannot do deep research from the phone."}
+
             if skill_name not in self.skills_registry:
                 logger.warning(f"Unknown skill: {skill_name}")
                 try:

@@ -159,7 +159,7 @@ function App() {
   )
 
   const { isConnected, sendVoice, sendText ,sendImage} = useWebSocket(
-    'ws://localhost:8000/ws',
+    `ws://localhost:8000/ws?token=${import.meta.env.VITE_WS_AUTH_TOKEN || ''}&device=laptop`,
     { onEvent: handleWsEvent }
   )
 
@@ -172,7 +172,7 @@ function App() {
         setMaxState('idle')
 
         try {
-          const ws = new WebSocket('ws://localhost:8000/ws')
+          const ws = new WebSocket(`ws://localhost:8000/ws?token=${import.meta.env.VITE_WS_AUTH_TOKEN || ''}`)
           ws.onopen = () => {
             ws.send(JSON.stringify({ type: 'abort' }))
             ws.close()
@@ -610,7 +610,7 @@ function App() {
                 stopAudio();
                 setMaxState('idle');
                 try {
-                  const ws = new WebSocket('ws://localhost:8000/ws');
+                  const ws = new WebSocket(`ws://localhost:8000/ws?token=${import.meta.env.VITE_WS_AUTH_TOKEN || ''}`);
                   ws.onopen = () => {
                     ws.send(JSON.stringify({ type: 'abort' }));
                     ws.close();

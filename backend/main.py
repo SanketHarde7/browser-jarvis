@@ -15,6 +15,10 @@ from pathlib import Path
 from datetime import datetime
 from typing import Optional, Dict, Any, List
 
+# Global state for multi-device voice concurrency lock
+_last_voice_ts = 0.0
+_last_voice_text = ""
+
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -364,6 +368,15 @@ async def process_voice_request(
 
         lower_trans = transcript.lower().strip()
         logger.info(f"STT: {transcript}")
+        
+        req_device = connection_state.get("device", "laptop")
+        from agent_core import get_active_device, set_active_device, get_active_websockets
+        
+        # ── STRICT DEVICE LOCK ──
+        # Only process voice from the explicitly active device.
+        if req_device != get_active_device():
+            logger.warning(f"Rejecting voice from {req_device} because active device is {get_active_device()}.")
+            return
 
         if connection_state["current_request_id"] != rid:
             logger.info(f"Voice task {rid} discarded before sending transcript.")
@@ -494,20 +507,26 @@ async def process_voice_request(
 
 
 @app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
+async def websocket_endpoint(websocket: WebSocket, token: str = None, device: str = "laptop"):
+    if config.WS_AUTH_TOKEN and token != config.WS_AUTH_TOKEN:
+        logger.warning(f"Unauthorized WebSocket connection attempt from {websocket.client}")
+        await websocket.close(code=1008)
+        return
+
     await websocket.accept()
-    logger.info(f"Client connected: {websocket.client}")
+    logger.info(f"Client connected: {websocket.client} as {device}")
 
     global main_loop
     main_loop = asyncio.get_running_loop()
     
     # Register globals in agent_core so acknowledgements can be sent
-    from agent_core import register_websocket, unregister_websocket
+    from agent_core import register_websocket, unregister_websocket, set_active_device
     register_websocket(websocket, main_loop)
 
     connection_state = {
         "active_task": None,
-        "current_request_id": None
+        "current_request_id": None,
+        "device": device
     }
 
     agent = get_agent()
@@ -529,6 +548,21 @@ async def websocket_endpoint(websocket: WebSocket):
 
             try:
                 msg_type = msg.get("type", "text")
+                
+                # 0. HANDLE CLAIM ACTIVE
+                if msg_type == "claim_active":
+                    req_device = msg.get("device", device)
+                    logger.info(f"Device {req_device} claimed active state explicitly.")
+                    set_active_device(req_device)
+                    from agent_core import get_active_websockets
+                    for ws in get_active_websockets():
+                        try:
+                            await ws.send_json({"event": "SWITCH_ACTIVE", "device": req_device})
+                        except:
+                            pass
+                    continue
+
+
 
                 # 1. HANDLE GREETING EXPLICITLY (Fixes Double Greeting)
                 if msg_type == "request_greeting":
