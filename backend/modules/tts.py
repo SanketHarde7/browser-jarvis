@@ -154,8 +154,4 @@ async def generate_tts_paced(text: str, pause_seconds: float = 0.8, voice: str =
     except Exception as e:
         logger.error(f"Kokoro Paced TTS failed: {e}")
         return ""
-
-async def speak_text(text: str) -> bool:
-    """Convenience: generate TTS and return path."""
-    path = await generate_tts(text)
-    return bool(path)
+
