@@ -128,12 +128,25 @@ MULTI-ACTION & BULK RULES
 - CRITICAL: Never combine words with "and" inside a single parameter! 
   WRONG: [SKILL:open_app:youtube and open notepad]
   RIGHT: [SKILL:web_open:youtube.com] [SKILL:open_app:notepad]
-- WEBSITES VS APPS: If asked to open Gemini, ChatGPT, GitHub, or any website, ALWAYS use [SKILL:web_open:url.com] (e.g. gemini.google.com). Do NOT use open_app for websites.
+- WEBSITES VS APPS: 
+  - If asked to open Google, YouTube, ChatGPT, Gemini, GitHub, Instagram, Facebook, or any website: YOU MUST USE [SKILL:web_open:domain.com].
+    Examples:
+      "google open karo" -> [SKILL:web_open:google.com]
+      "open google" -> [SKILL:web_open:google.com]
+      "youtube open karo" -> [SKILL:web_open:youtube.com]
+      "open youtube" -> [SKILL:web_open:youtube.com]
+      "chatgpt open karo" -> [SKILL:web_open:chatgpt.com]
+      "gemini open karo" -> [SKILL:web_open:gemini.google.com]
+  - If asked to open desktop apps (Notepad, Calculator, VS Code, Chrome app, Explorer, Terminal): YOU MUST USE [SKILL:open_app:app_name].
+    Examples:
+      "open notepad" -> [SKILL:open_app:notepad]
+      "open chrome" -> [SKILL:open_app:chrome]
 - REDUNDANT: Avoid duplicate actions. youtube_play is enough; don't add open_app:youtube.
 - WEB AUTOMATION FALLBACK: For specific website tasks, use [SKILL:web_open:url] with direct URL.
 - For news, scores, current events, prices -> [SKILL:search:query]. Never guess.
 - Open browser ONLY when Sanket explicitly says "open", "go to", or "play".
 - WEB_OPEN EXTRACTION: Extract ONLY the target website name. Strip words like 'open', 'karo', 'kholo', 'new tab', 'me', 'browser'.
+  'google open karo' -> [SKILL:web_open:google.com]
   'new tab me youtube open karo' -> [SKILL:web_open:youtube.com]
   'chrome mein github kholo' -> [SKILL:web_open:github.com]
   'clipboard ki link open karo' -> [SKILL:open_link:clipboard]
@@ -199,6 +212,11 @@ DECISION GUIDE
 - Type text anywhere -> [SKILL:type_text:<text>]
   Example: "Type hello world" -> [SKILL:type_text:hello world]
   NOTE: This types text directly into the active window.
+- Press key (enter, space, backspace, tab, esc) -> [SKILL:key_press:<key_name>]
+  Example: "press enter" -> [SKILL:key_press:enter]
+  Example: "hit enter" -> [SKILL:key_press:enter]
+- Read the screen / what's on my screen -> [SKILL:read_screen]
+  Example: "Read the screen and tell me what it's showing" -> [SKILL:read_screen]
 - Quit/exit MAX? -> quit_max
 - Casual chat/greeting? -> reply directly, no skill
 - About MAX? -> reply directly, no skill
@@ -232,6 +250,7 @@ DECISION GUIDE
     "Get ChatGPT to write the code and use Gemini to review it" -> [SKILL:ai_chain:chatgpt:gemini:Write and review code for X]
 - ai_ask platforms: chatgpt, gemini, copilot, claude(if listen cloud then trigger claude as a platform), perplexity (use lowercase)
 
+REAL-TIME DATE & TIME: {time_context}
 PERSONALITY CONTEXT: {personality_context}
 CURRENT EMOTIONAL STATE: {emotion_context}
 MEMORY CONTEXT: {memory_context}"""
@@ -269,6 +288,7 @@ MOOD AWARENESS
 - Happy? Match it lightly.
 - Chatty? Engage, ask one question back.
 
+REAL-TIME DATE & TIME: {time_context}
 PERSONALITY CONTEXT: {personality_context}
 CURRENT EMOTIONAL STATE: {emotion_context}
 MEMORY CONTEXT: {memory_context}"""
@@ -393,9 +413,13 @@ async def get_response(user_text: str, memory_context: str = "", allow_skills: b
         emotion_injection = get_emotion_prompt_injection()
         personality_injection = get_personality_injection()
 
+        from datetime import datetime
+        time_context = datetime.now().strftime("%A, %B %d, %Y at %I:%M %p")
+
         if allow_skills:
             system_prompt = (
                 SYSTEM_PROMPT_SKILLS
+                .replace("{time_context}", time_context)
                 .replace("{memory_context}", memory_context or "None")
                 .replace("{emotion_context}", emotion_injection)
                 .replace("{personality_context}", personality_injection)
@@ -403,6 +427,7 @@ async def get_response(user_text: str, memory_context: str = "", allow_skills: b
         else:
             system_prompt = (
                 SYSTEM_PROMPT_CONVERSATION
+                .replace("{time_context}", time_context)
                 .replace("{memory_context}", memory_context or "None")
                 .replace("{emotion_context}", emotion_injection)
                 .replace("{personality_context}", personality_injection)
