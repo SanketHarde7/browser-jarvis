@@ -1,236 +1,391 @@
 @import "tailwindcss";
 
-@import "tailwindcss";
-
-@layer base {
-  body {
-    background-color: #05070B; /* Primary Background */
-    color: #F8FAFC; /* Primary Text */
-    font-family: "SF Pro Display", Inter, sans-serif;
-    overflow: hidden;
-    margin: 0;
-    padding: 0;
-  }
-}
-
-/* Glassmorphism System from PRD */
-.glass {
-  background: rgba(255, 255, 255, 0.05);
-  backdrop-filter: blur(28px) saturate(180%) brightness(110%);
-  -webkit-backdrop-filter: blur(28px) saturate(180%) brightness(110%);
-  border: 1px solid rgba(255, 255, 255, 0.10);
-  /* Reflection: Top edge Slight white highlight Opacity 6% */
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06);
-}
-
-/* Legacy class alias for compatibility during transition */
-.glass-panel {
-  background: rgba(255, 255, 255, 0.05);
-  backdrop-filter: blur(28px) saturate(180%) brightness(110%);
-  -webkit-backdrop-filter: blur(28px) saturate(180%) brightness(110%);
-  border: 1px solid rgba(255, 255, 255, 0.10);
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06);
-}
+/* ═══════════════════════════════════════════════════════════════
+   MAX Mobile — Premium+ Glassmorphic Design System
+   Expert-grade depth, layering, and refined aesthetics
+   ═══════════════════════════════════════════════════════════════ */
 
 :root {
   --safe-top: env(safe-area-inset-top, 0px);
   --safe-bottom: env(safe-area-inset-bottom, 0px);
-  --text-primary: #f8fafc;
-  --text-muted: rgba(248, 250, 252, 0.68);
-  --text-dim: rgba(248, 250, 252, 0.42);
-  --neon-blue: #52c8ff;
-  --neon-purple: #b45cff;
-  --neon-pink: #ff3fd7;
+
+  /* ── Color Tokens ── */
+  --bg-void: #030508;
+
+  --text-primary: #e8ecf1;
+  --text-secondary: rgba(232, 236, 241, 0.68);
+  --text-muted: rgba(232, 236, 241, 0.40);
+  --text-dim: rgba(232, 236, 241, 0.22);
+
+  /* Aurora palette */
+  --aurora-cyan: #52C8FF;
+  --aurora-violet: #8B5CF6;
+  --aurora-magenta: #D946EF;
+  --aurora-gradient: linear-gradient(135deg, var(--aurora-cyan), var(--aurora-violet) 48%, var(--aurora-magenta));
+
+  /* Glass tokens */
+  --glass-bg: rgba(14, 17, 24, 0.48);
+  --glass-border-light: rgba(255, 255, 255, 0.10);
+  --glass-border-subtle: rgba(255, 255, 255, 0.05);
+  --glass-inner-shine: rgba(255, 255, 255, 0.12);
+  --glass-blur: 20px;
 }
 
-* { box-sizing: border-box; }
-html, body, #root { width: 100%; height: 100%; }
-button, input { font: inherit; }
+/* ── Reset ── */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+html, body, #root { width: 100%; height: 100%; overflow: hidden; }
+body {
+  background: var(--bg-void);
+  color: var(--text-primary);
+  font-family: 'Inter', -apple-system, 'SF Pro Display', 'Segoe UI', sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  -webkit-tap-highlight-color: transparent;
+}
+button, input, textarea { font: inherit; }
 
 .sr-only {
-  position: absolute;
-  width: 1px;
-  height: 1px;
-  padding: 0;
-  margin: -1px;
-  overflow: hidden;
-  clip: rect(0, 0, 0, 0);
-  white-space: nowrap;
-  border: 0;
+  position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+  overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0;
 }
 
+/* ═══════════════════════════════════════════════════════════════
+   GLASS SYSTEM — 3-tier depth hierarchy
+   Each tier has distinct blur, shadow depth, and inner reflection
+   to create convincing physical layering
+   ═══════════════════════════════════════════════════════════════ */
+
+/* Tier 1: Recessed / subtle (status indicators, labels) */
+.glass-1 {
+  background: rgba(14, 17, 24, 0.32);
+  backdrop-filter: blur(12px) saturate(140%);
+  -webkit-backdrop-filter: blur(12px) saturate(140%);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.06),
+    0 2px 8px rgba(0, 0, 0, 0.3);
+}
+
+/* Tier 2: Mid-level (message bubbles, cards) */
+.glass-2,
+.glass {
+  background: rgba(14, 17, 24, 0.42);
+  backdrop-filter: blur(var(--glass-blur)) saturate(150%);
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(150%);
+  border: 1px solid var(--glass-border-light);
+  border-bottom-color: var(--glass-border-subtle);
+  border-right-color: var(--glass-border-subtle);
+  box-shadow:
+    inset 0 1px 0 var(--glass-inner-shine),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.15),
+    0 4px 16px rgba(0, 0, 0, 0.35),
+    0 1px 3px rgba(0, 0, 0, 0.25);
+}
+
+/* Tier 3: Elevated / prominent (input bar, modals) */
+.glass-3 {
+  background: rgba(14, 17, 24, 0.52);
+  backdrop-filter: blur(28px) saturate(160%);
+  -webkit-backdrop-filter: blur(28px) saturate(160%);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-bottom-color: rgba(255, 255, 255, 0.04);
+  border-right-color: rgba(255, 255, 255, 0.04);
+  box-shadow:
+    inset 0 1px 1px rgba(255, 255, 255, 0.14),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.20),
+    0 8px 32px rgba(0, 0, 0, 0.45),
+    0 2px 6px rgba(0, 0, 0, 0.30),
+    0 0 0 0.5px rgba(255, 255, 255, 0.05);
+}
+
+/* ═══════════════════════════════════════════
+   SHELL — full-screen vertical flex container
+   ═══════════════════════════════════════════ */
 .max-shell {
   position: relative;
-  width: 100vw;
+  width: 100%;
   height: 100dvh;
   min-height: 100vh;
-  overflow: hidden;
-  background: #05070b;
-  color: var(--text-primary);
   display: flex;
   flex-direction: column;
+  overflow: hidden;
   isolation: isolate;
 }
 
+/* ═══════════════════════════════════════════
+   HEADER — minimal, floating over content
+   ═══════════════════════════════════════════ */
 .max-header {
-  position: relative;
-  z-index: 20;
+  position: absolute;
+  top: 0; left: 0; right: 0;
+  z-index: 30;
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
-  padding: calc(1rem + var(--safe-top)) 1rem 0.75rem;
+  padding: calc(0.85rem + var(--safe-top)) 1.25rem 0;
   pointer-events: none;
 }
 
 .max-title {
-  margin: 0;
-  font-size: clamp(1.55rem, 8vw, 2.1rem);
-  line-height: 0.9;
-  letter-spacing: 0.04em;
-  font-weight: 800;
-  background: linear-gradient(135deg, var(--neon-blue), var(--neon-purple) 48%, var(--neon-pink));
+  font-size: 1.6rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  line-height: 1;
+  background: var(--aurora-gradient);
   -webkit-background-clip: text;
   background-clip: text;
   color: transparent;
-  text-shadow: 0 0 24px rgba(180, 92, 255, 0.34);
+  filter: drop-shadow(0 0 12px rgba(139, 92, 246, 0.25));
 }
 
 .max-subtitle {
-  margin: 0.42rem 0 0;
+  margin-top: 0.25rem;
   color: var(--text-muted);
-  font-size: 0.75rem;
-  letter-spacing: 0.01em;
+  font-size: 0.68rem;
+  letter-spacing: 0.04em;
+  font-weight: 400;
 }
 
-.max-icon-button {
-  width: 2.45rem;
-  height: 2.45rem;
+.max-icon-btn {
+  width: 2.25rem;
+  height: 2.25rem;
   border: 0;
-  border-radius: 999px;
-  color: rgba(248, 250, 252, 0.78);
+  border-radius: 50%;
   display: grid;
   place-items: center;
-  background: rgba(255, 255, 255, 0.06);
+  color: var(--text-secondary);
+  background: rgba(255, 255, 255, 0.05);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid rgba(255, 255, 255, 0.08);
   cursor: pointer;
   pointer-events: auto;
+  transition: all 0.25s ease;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.08),
+    0 2px 8px rgba(0, 0, 0, 0.3);
+}
+.max-icon-btn:active {
+  transform: scale(0.94);
+  background: rgba(255, 255, 255, 0.10);
 }
 
-.max-stage {
-  position: relative;
-  z-index: 5;
-  flex: 1;
-  min-height: 0;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 0 1rem;
-}
-
-.orb-canvas-wrap {
+/* ═══════════════════════════════════════════
+   ORB STAGE — takes up the full screen, centered
+   ═══════════════════════════════════════════ */
+.orb-stage {
   position: absolute;
-  inset: clamp(3.8rem, 12vh, 6rem) 0 clamp(7rem, 18vh, 9.5rem);
+  inset: 0;
   z-index: 1;
-  display: flex;
-  align-items: center;
-  justify-content: center;
   pointer-events: none;
 }
 
-.orb-wave-wrap {
+/* ═══════════════════════════════════════════
+   CONVERSATION — floats over the orb, bottom-aligned
+   ═══════════════════════════════════════════ */
+.conversation-layer {
   position: absolute;
-  z-index: 2;
-  width: min(118vw, 31rem);
-  height: min(118vw, 31rem);
-  left: 50%;
-  top: 48%;
-  transform: translate(-50%, -50%);
-  pointer-events: none;
-}
-
-.chat-layer {
-  position: absolute;
+  inset: 0;
   z-index: 10;
-  inset: 0 0 0 0;
-  pointer-events: none;
   display: flex;
-  align-items: stretch;
-  justify-content: center;
+  flex-direction: column;
+  pointer-events: none;
 }
 
-.chat-scroll {
-  width: 100%;
-  max-width: 31rem;
-  height: 100%;
+.conversation-scroll {
+  flex: 1;
   overflow-y: auto;
   scrollbar-width: none;
-  padding: 0.5rem 0 9.4rem;
   display: flex;
   flex-direction: column;
   justify-content: flex-end;
   gap: 0.65rem;
+  padding: calc(5rem + var(--safe-top)) 1rem calc(6.5rem + var(--safe-bottom));
   pointer-events: auto;
-  mask-image: linear-gradient(to bottom, transparent 0, black 2.5rem, black calc(100% - 1rem));
+  mask-image: linear-gradient(
+    to bottom,
+    transparent 0,
+    black calc(5rem + var(--safe-top)),
+    black calc(100% - 1.5rem),
+    transparent 100%
+  );
 }
-.chat-scroll::-webkit-scrollbar { display: none; }
+.conversation-scroll::-webkit-scrollbar { display: none; }
 
+/* ── Greeting Card (empty state only) ── */
 .greeting-card {
-  width: min(100%, 23rem);
+  width: min(92%, 22rem);
   align-self: center;
   margin-top: auto;
+  margin-bottom: 1.5rem;
   border-radius: 1.15rem;
-  padding: 1rem 1.1rem;
+  padding: 1.1rem 1.2rem;
   display: flex;
   align-items: center;
   justify-content: space-between;
-  background: rgba(10, 18, 38, 0.54);
-  box-shadow: inset 0 1px 0 rgba(255,255,255,0.07), 0 18px 60px rgba(0,0,0,0.28);
+  gap: 0.75rem;
 }
-.greeting-card h2 { margin: 0; font-size: 0.95rem; font-weight: 650; }
-.greeting-card p { margin: 0.28rem 0 0; color: var(--text-muted); font-size: 0.78rem; }
-.greeting-card span { color: var(--text-dim); font-size: 1.35rem; }
-
-.message-row { display: flex; width: 100%; padding: 0 0.25rem; }
-.message-row-user { justify-content: flex-end; }
-.message-row-ai { justify-content: flex-start; }
-.message-bubble {
-  max-width: min(82%, 22rem);
-  border-radius: 1.05rem;
-  padding: 0.78rem 0.9rem;
-  background: rgba(8, 15, 32, 0.58);
-  box-shadow: 0 16px 46px rgba(0, 0, 0, 0.2);
+.greeting-card h2 {
+  font-size: 0.92rem;
+  font-weight: 600;
+  line-height: 1.25;
+  color: var(--text-primary);
 }
-.message-user { border-bottom-right-radius: 0.35rem; background: rgba(52, 116, 255, 0.16); }
-.message-ai { border-bottom-left-radius: 0.35rem; background: rgba(255, 255, 255, 0.055); }
-.message-bubble span { display: block; margin-bottom: 0.28rem; font-size: 0.64rem; letter-spacing: 0.12em; text-transform: uppercase; color: var(--neon-blue); font-weight: 800; }
-.message-ai span { color: var(--neon-purple); }
-.message-bubble p { margin: 0; color: rgba(248, 250, 252, 0.9); font-size: 0.9rem; line-height: 1.45; }
+.greeting-card p {
+  margin-top: 0.2rem;
+  color: var(--text-secondary);
+  font-size: 0.76rem;
+}
+.greeting-card .greeting-arrow {
+  color: var(--text-dim);
+  font-size: 1.25rem;
+  flex-shrink: 0;
+}
 
-.typing-dots { display: flex; gap: 0.32rem; padding: 0.22rem 0; }
-.typing-dots i { width: 0.4rem; height: 0.4rem; border-radius: 999px; background: var(--neon-purple); animation: maxTyping 1s infinite ease-in-out; }
-.typing-dots i:nth-child(2) { animation-delay: 0.14s; }
-.typing-dots i:nth-child(3) { animation-delay: 0.28s; }
-@keyframes maxTyping { 0%, 80%, 100% { opacity: 0.35; transform: translateY(0); } 40% { opacity: 1; transform: translateY(-0.18rem); } }
+/* ── Message Bubbles — layered glass with depth ── */
+.msg-row {
+  display: flex;
+  width: 100%;
+  padding: 0 0.15rem;
+}
+.msg-row-user { justify-content: flex-end; }
+.msg-row-ai { justify-content: flex-start; }
 
-.bottom-controls {
+.msg-bubble {
+  max-width: min(84%, 22rem);
+  border-radius: 1.1rem;
+  padding: 0.72rem 0.92rem;
   position: relative;
-  z-index: 30;
-  padding: 0 1rem calc(0.95rem + var(--safe-bottom));
-  display: grid;
-  gap: 0.55rem;
-  justify-items: center;
 }
 
+/* User message — tinted with state color, elevated glass */
+.msg-user {
+  border-bottom-right-radius: 0.3rem;
+  background: rgba(14, 17, 24, 0.38);
+  backdrop-filter: blur(18px) saturate(145%);
+  -webkit-backdrop-filter: blur(18px) saturate(145%);
+  border: 1px solid rgba(255, 255, 255, 0.10);
+  border-bottom-color: rgba(255, 255, 255, 0.03);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.10),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.12),
+    0 4px 16px rgba(0, 0, 0, 0.30),
+    0 0 12px color-mix(in srgb, var(--state-color) 15%, transparent);
+}
+
+/* AI message — neutral deeper glass */
+.msg-ai {
+  border-bottom-left-radius: 0.3rem;
+  background: rgba(10, 13, 20, 0.45);
+  backdrop-filter: blur(16px) saturate(140%);
+  -webkit-backdrop-filter: blur(16px) saturate(140%);
+  border: 1px solid rgba(139, 92, 246, 0.10);
+  border-bottom-color: rgba(139, 92, 246, 0.03);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.07),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.12),
+    0 4px 12px rgba(0, 0, 0, 0.25);
+}
+
+.msg-bubble .msg-label {
+  display: block;
+  margin-bottom: 0.18rem;
+  font-size: 0.58rem;
+  letter-spacing: 0.10em;
+  text-transform: uppercase;
+  font-weight: 700;
+}
+.msg-user .msg-label { color: var(--state-color); opacity: 0.85; }
+.msg-ai .msg-label { color: var(--aurora-violet); opacity: 0.75; }
+
+.msg-bubble .msg-text {
+  color: rgba(232, 236, 241, 0.90);
+  font-size: 0.86rem;
+  line-height: 1.52;
+  font-weight: 400;
+}
+
+/* ── Typing indicator ── */
+.typing-dots {
+  display: flex;
+  gap: 0.28rem;
+  padding: 0.2rem 0;
+}
+.typing-dots i {
+  width: 0.35rem;
+  height: 0.35rem;
+  border-radius: 50%;
+  background: var(--aurora-violet);
+  animation: dotPulse 1.1s ease-in-out infinite;
+}
+.typing-dots i:nth-child(2) { animation-delay: 0.15s; }
+.typing-dots i:nth-child(3) { animation-delay: 0.3s; }
+@keyframes dotPulse {
+  0%, 80%, 100% { opacity: 0.25; transform: translateY(0); }
+  40% { opacity: 1; transform: translateY(-0.18rem); }
+}
+
+/* ═══════════════════════════════════════════
+   BOTTOM BAR — input + mic, pinned to bottom
+   ═══════════════════════════════════════════ */
+.bottom-bar {
+  position: absolute;
+  bottom: 0; left: 0; right: 0;
+  z-index: 25;
+  padding: 0.65rem 0.85rem max(4.5rem, calc(2rem + var(--safe-bottom)));
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.5rem;
+  pointer-events: none;
+  /* Smooth gradient fade — messages dissolve behind naturally */
+  background: linear-gradient(
+    to top,
+    rgba(3, 5, 8, 0.95) 0%,
+    rgba(3, 5, 8, 0.75) 40%,
+    rgba(3, 5, 8, 0.35) 70%,
+    transparent 100%
+  );
+}
+
+/* ── Input Bar — elevated glass-3 tier ── */
 .input-bar {
-  width: min(100%, 30rem);
-  min-height: 3.95rem;
+  width: 100%;
+  max-width: 28rem;
+  min-height: 3.2rem;
   border-radius: 999px;
-  padding: 0.45rem 0.48rem 0.45rem 0.72rem;
+  padding: 0.3rem 0.35rem 0.3rem 0.85rem;
   display: flex;
   align-items: center;
-  gap: 0.45rem;
-  background: rgba(7, 13, 30, 0.68);
-  box-shadow: inset 0 1px 0 rgba(255,255,255,0.08), 0 18px 70px rgba(24, 74, 255, 0.24);
+  gap: 0.4rem;
+  /* Elevated glass with state-colored ambient glow */
+  background: rgba(14, 17, 24, 0.55);
+  backdrop-filter: blur(28px) saturate(160%);
+  -webkit-backdrop-filter: blur(28px) saturate(160%);
+  border: 1px solid rgba(255, 255, 255, 0.10);
+  border-bottom-color: rgba(255, 255, 255, 0.03);
+  box-shadow:
+    inset 0 1px 1px rgba(255, 255, 255, 0.12),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.18),
+    0 6px 24px rgba(0, 0, 0, 0.40),
+    0 2px 6px rgba(0, 0, 0, 0.25),
+    0 0 20px color-mix(in srgb, var(--state-color) 10%, transparent);
+  transition: box-shadow 0.35s ease, border-color 0.35s ease;
+  position: relative;
+  isolation: isolate;
+  pointer-events: auto;
 }
+
+.input-bar:focus-within {
+  border-color: rgba(255, 255, 255, 0.14);
+  box-shadow:
+    inset 0 1px 1px rgba(255, 255, 255, 0.14),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.18),
+    0 8px 32px rgba(0, 0, 0, 0.45),
+    0 2px 6px rgba(0, 0, 0, 0.30),
+    0 0 28px color-mix(in srgb, var(--state-color) 14%, transparent);
+}
+
 .input-field-wrap { flex: 1; min-width: 0; }
 .input-field-wrap input {
   width: 100%;
@@ -238,58 +393,134 @@ button, input { font: inherit; }
   outline: 0;
   background: transparent;
   color: var(--text-primary);
-  font-size: 0.94rem;
+  font-size: 0.88rem;
+  font-weight: 400;
 }
-.input-field-wrap input::placeholder { color: rgba(248, 250, 252, 0.43); }
+.input-field-wrap input::placeholder {
+  color: var(--text-dim);
+  font-weight: 400;
+}
+
 .input-action {
-  width: 2.25rem;
-  height: 2.25rem;
+  width: 2rem;
+  height: 2rem;
   border: 0;
-  border-radius: 999px;
+  border-radius: 50%;
   display: grid;
   place-items: center;
-  color: rgba(248, 250, 252, 0.5);
+  color: var(--text-muted);
   background: transparent;
+  cursor: pointer;
+  transition: color 0.2s ease;
 }
-.mic-button {
-  width: 3.05rem;
-  height: 3.05rem;
+.input-action:hover { color: var(--text-secondary); }
+.input-action:disabled { opacity: 0.30; cursor: not-allowed; }
+
+/* ── Mic Button — frosted glass orb with subtle inner glow ── */
+.mic-btn {
+  width: 2.65rem;
+  height: 2.65rem;
   border: 0;
-  border-radius: 999px;
+  border-radius: 50%;
   display: grid;
   place-items: center;
   color: white;
   cursor: pointer;
-  background: radial-gradient(circle at 30% 20%, #ffffff 0, #7ddcff 14%, #4057ff 52%, #8c35ff 100%);
-  box-shadow: 0 0 0 1px rgba(255,255,255,0.22), 0 0 28px rgba(104, 91, 255, 0.65), inset 0 -8px 16px rgba(0,0,0,0.22);
   touch-action: none;
+  flex-shrink: 0;
+  /* Frosted glass sphere with inner light */
+  background:
+    radial-gradient(circle at 35% 30%, rgba(255,255,255,0.18) 0%, transparent 50%),
+    linear-gradient(135deg, rgba(82, 200, 255, 0.35), rgba(139, 92, 246, 0.45) 50%, rgba(217, 70, 239, 0.35));
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  box-shadow:
+    inset 0 1px 2px rgba(255, 255, 255, 0.20),
+    inset 0 -2px 6px rgba(0, 0, 0, 0.20),
+    0 4px 16px rgba(82, 200, 255, 0.18),
+    0 2px 4px rgba(0, 0, 0, 0.25);
+  transition: box-shadow 0.25s ease, transform 0.15s ease;
 }
-.mic-button.recording, .mic-button.state-listening { background: radial-gradient(circle at 30% 20%, #fff 0, #76f5ff 15%, #157cff 50%, #d83cff 100%); box-shadow: 0 0 34px rgba(216, 60, 255, 0.82); }
-.send-button { background: linear-gradient(135deg, #52c8ff, #8c35ff); }
-.input-action:disabled, .mic-button:disabled { opacity: 0.45; cursor: not-allowed; }
+.mic-btn:active {
+  transform: scale(0.92);
+}
+.mic-btn.recording {
+  background:
+    radial-gradient(circle at 35% 30%, rgba(255,255,255,0.22) 0%, transparent 50%),
+    linear-gradient(135deg, rgba(82, 200, 255, 0.5), rgba(139, 92, 246, 0.55) 50%, rgba(217, 70, 239, 0.5));
+  box-shadow:
+    inset 0 1px 2px rgba(255, 255, 255, 0.22),
+    inset 0 -2px 6px rgba(0, 0, 0, 0.18),
+    0 0 28px rgba(139, 92, 246, 0.5),
+    0 0 48px rgba(217, 70, 239, 0.25);
+  animation: micPulse 1.5s ease-in-out infinite;
+}
+.mic-btn:disabled { opacity: 0.35; cursor: not-allowed; }
 
-.max-stop-button {
+@keyframes micPulse {
+  0%, 100% { box-shadow: inset 0 1px 2px rgba(255,255,255,0.22), inset 0 -2px 6px rgba(0,0,0,0.18), 0 0 28px rgba(139,92,246,0.5), 0 0 48px rgba(217,70,239,0.25); }
+  50% { box-shadow: inset 0 1px 2px rgba(255,255,255,0.25), inset 0 -2px 6px rgba(0,0,0,0.15), 0 0 38px rgba(139,92,246,0.65), 0 0 60px rgba(217,70,239,0.35); }
+}
+
+/* Send button variant */
+.send-btn {
+  background:
+    radial-gradient(circle at 35% 30%, rgba(255,255,255,0.15) 0%, transparent 50%),
+    linear-gradient(135deg, var(--aurora-cyan), var(--aurora-violet));
+  box-shadow:
+    inset 0 1px 2px rgba(255, 255, 255, 0.18),
+    0 4px 16px rgba(82, 200, 255, 0.22);
+}
+
+/* Stop button */
+.stop-btn {
   border: 0;
   border-radius: 999px;
-  padding: 0.48rem 0.9rem;
+  padding: 0.38rem 0.85rem;
   color: #ff8aa9;
-  background: rgba(255, 58, 92, 0.12);
+  background: rgba(255, 58, 92, 0.08);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid rgba(255, 58, 92, 0.15);
+  font-size: 0.76rem;
+  font-weight: 600;
+  cursor: pointer;
+  pointer-events: auto;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.05),
+    0 2px 8px rgba(0, 0, 0, 0.2);
+  transition: background 0.2s ease;
 }
-.max-error {
-  position: fixed;
-  z-index: 45;
-  left: 1rem;
-  right: 1rem;
-  top: calc(4.7rem + var(--safe-top));
-  margin: 0 auto;
-  max-width: 30rem;
-  border-radius: 0.9rem;
-  padding: 0.75rem 0.9rem;
-  color: #ffb4c4;
-  background: rgba(80, 12, 28, 0.58);
-  font-size: 0.84rem;
+.stop-btn:active {
+  background: rgba(255, 58, 92, 0.14);
 }
 
+/* ═══════════════════════════════════════════
+   ERROR TOAST
+   ═══════════════════════════════════════════ */
+.error-toast {
+  position: fixed;
+  z-index: 50;
+  left: 1rem; right: 1rem;
+  top: calc(4.5rem + var(--safe-top));
+  margin: 0 auto;
+  max-width: 26rem;
+  border-radius: 0.85rem;
+  padding: 0.65rem 0.85rem;
+  color: #ffb4c4;
+  background: rgba(60, 10, 22, 0.55);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid rgba(255, 58, 92, 0.12);
+  font-size: 0.82rem;
+  text-align: center;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.05),
+    0 4px 16px rgba(0, 0, 0, 0.3);
+}
+
+/* ═══════════════════════════════════════════
+   SETTINGS MODAL — elevated glass panel
+   ═══════════════════════════════════════════ */
 .settings-backdrop {
   position: fixed;
   inset: 0;
@@ -297,30 +528,200 @@ button, input { font: inherit; }
   display: grid;
   place-items: center;
   padding: 1rem;
-  background: rgba(0, 0, 0, 0.58);
+  background: rgba(0, 0, 0, 0.5);
   backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
 }
+
 .settings-card {
-  width: min(100%, 24rem);
-  border-radius: 1.35rem;
-  padding: 1.25rem;
-  background: rgba(7, 13, 30, 0.84);
+  width: min(100%, 22rem);
+  border-radius: 1.25rem;
+  padding: 1.15rem;
+  /* Highest glass tier for modal */
+  background: rgba(10, 14, 24, 0.72);
+  backdrop-filter: blur(32px) saturate(160%);
+  -webkit-backdrop-filter: blur(32px) saturate(160%);
+  border: 1px solid rgba(255, 255, 255, 0.10);
+  border-bottom-color: rgba(255, 255, 255, 0.03);
+  box-shadow:
+    inset 0 1px 1px rgba(255, 255, 255, 0.12),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.15),
+    0 12px 48px rgba(0, 0, 0, 0.55),
+    0 2px 8px rgba(0, 0, 0, 0.30);
 }
-.settings-card h2 { margin: 0 0 1rem; font-size: 1.15rem; }
-.settings-card label { display: block; margin-bottom: 0.45rem; color: var(--text-muted); font-size: 0.82rem; }
+.settings-card h2 {
+  font-size: 1.02rem;
+  font-weight: 650;
+  margin-bottom: 0.85rem;
+  color: var(--text-primary);
+}
+.settings-card label {
+  display: block;
+  margin-bottom: 0.35rem;
+  color: var(--text-secondary);
+  font-size: 0.78rem;
+  font-weight: 500;
+}
 .settings-card input {
   width: 100%;
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  border-radius: 0.9rem;
-  padding: 0.8rem;
-  color: white;
-  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 0.75rem;
+  padding: 0.65rem 0.75rem;
+  color: var(--text-primary);
+  background: rgba(255, 255, 255, 0.04);
   outline: none;
+  font-size: 0.86rem;
+  transition: border-color 0.2s ease;
 }
-.settings-actions { display: flex; justify-content: flex-end; gap: 0.7rem; margin-top: 1rem; }
-.settings-actions button { border: 0; border-radius: 0.75rem; padding: 0.6rem 0.8rem; color: rgba(255,255,255,0.72); background: transparent; }
-.settings-actions button:last-child { color: var(--neon-blue); background: rgba(82, 200, 255, 0.14); }
+.settings-card input:focus {
+  border-color: rgba(82, 200, 255, 0.25);
+}
 
+.settings-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.6rem;
+  margin-top: 0.85rem;
+}
+.settings-actions button {
+  border: 0;
+  border-radius: 0.65rem;
+  padding: 0.5rem 0.75rem;
+  font-size: 0.8rem;
+  cursor: pointer;
+  transition: background 0.2s ease;
+}
+.settings-actions .cancel-btn {
+  color: var(--text-secondary);
+  background: transparent;
+}
+.settings-actions .cancel-btn:hover {
+  background: rgba(255, 255, 255, 0.05);
+}
+.settings-actions .save-btn {
+  color: var(--aurora-cyan);
+  background: rgba(82, 200, 255, 0.10);
+  font-weight: 600;
+  border: 1px solid rgba(82, 200, 255, 0.12);
+}
+.settings-actions .save-btn:hover {
+  background: rgba(82, 200, 255, 0.16);
+}
+
+/* ═══════════════════════════════════════════
+   BOOT SEQUENCE
+   ═══════════════════════════════════════════ */
+.boot-screen {
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  background: var(--bg-void);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+}
+
+.boot-screen.dismissing {
+  animation: bootDismiss 0.6s ease forwards;
+}
+
+.boot-title {
+  font-size: clamp(2.5rem, 8vw, 4.5rem);
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  background: var(--aurora-gradient);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  filter: drop-shadow(0 0 24px rgba(139, 92, 246, 0.3));
+  animation: bootFadeIn 0.8s ease;
+  margin-bottom: 2.5rem;
+}
+
+.boot-divider {
+  width: 200px;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, rgba(82, 200, 255, 0.3), transparent);
+  margin-bottom: 2rem;
+  animation: bootLineExpand 0.8s ease;
+}
+
+.boot-lines {
+  font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
+  font-size: 0.78rem;
+  color: var(--text-dim);
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  max-width: 420px;
+  width: 85%;
+}
+
+.boot-line {
+  animation: bootFadeIn 0.3s ease forwards;
+  color: var(--text-dim);
+  transition: color 0.3s ease;
+}
+.boot-line.active {
+  color: var(--aurora-cyan);
+}
+.boot-line .cursor {
+  animation: blink 1s step-end infinite;
+}
+
+.boot-status {
+  position: absolute;
+  bottom: 3rem;
+  font-size: 0.82rem;
+  font-weight: 600;
+  letter-spacing: 0.15em;
+  color: var(--aurora-cyan);
+  animation: bootFadeIn 0.5s ease;
+  filter: drop-shadow(0 0 8px rgba(82, 200, 255, 0.3));
+}
+
+@keyframes bootFadeIn {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+@keyframes bootLineExpand {
+  from { width: 0; opacity: 0; }
+  to { width: 200px; opacity: 1; }
+}
+@keyframes bootDismiss {
+  to { opacity: 0; transform: scale(1.02); }
+}
+@keyframes blink {
+  50% { opacity: 0; }
+}
+
+/* ═══════════════════════════════════════════
+   BACKGROUND ENGINE — pure CSS animations
+   (replacing framer-motion for mobile perf)
+   ═══════════════════════════════════════════ */
+@keyframes starTwinkle {
+  0%, 100% { opacity: inherit; }
+  50% { opacity: 0.02; }
+}
+
+@keyframes auroraFloat {
+  0% { transform: translate(-3%, -3%); }
+  25% { transform: translate(2%, -1%); }
+  50% { transform: translate(3%, 3%); }
+  75% { transform: translate(-1%, 2%); }
+  100% { transform: translate(-3%, -3%); }
+}
+
+/* ═══════════════════════════════════════════
+   RESPONSIVE — desktop gets phone-width constraint
+   ═══════════════════════════════════════════ */
 @media (min-width: 700px) {
-  .max-shell { width: min(100vw, 31rem); margin: 0 auto; border-inline: 1px solid rgba(255,255,255,0.06); }
+  .max-shell {
+    max-width: 430px;
+    margin: 0 auto;
+    border-left: 1px solid rgba(255, 255, 255, 0.03);
+    border-right: 1px solid rgba(255, 255, 255, 0.03);
+  }
 }
