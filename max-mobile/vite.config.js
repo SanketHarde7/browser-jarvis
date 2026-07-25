@@ -8,6 +8,7 @@ export default defineConfig({
     react(),
     tailwindcss(),
   ],
+  envDir: '../',
   server: {
     host: '0.0.0.0', // Allow external connections for mobile testing
     port: 5173
