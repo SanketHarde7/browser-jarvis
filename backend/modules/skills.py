@@ -39,7 +39,7 @@ except ImportError:
     PYWHATKIT_AVAILABLE = False
 
 DATA_SKILLS = {
-    "weather", "search", "note", "timer", "time_now", "date_today",
+    "weather", "search", "note", "timer",
     "find_and_explain", "list_files", "read_file",
     "code_review", "run_code", "search_files",
     "read_screen", "list_windows",
@@ -103,9 +103,18 @@ def _truncate_for_tts(result: str, skill_name: str) -> str:
 
 def open_url_in_browser(url: str) -> None:
     logger.info(f"Opening URL in browser: {url}")
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
     try:
         if platform.system() == "Windows":
-            os.startfile(url)
+            try:
+                import webbrowser
+                webbrowser.open(url, new=2, autoraise=True)
+            except Exception:
+                try:
+                    os.startfile(url)
+                except Exception:
+                    subprocess.Popen(f'start "" "{url}"', shell=True)
         elif platform.system() == "Darwin":
             subprocess.Popen(["open", url])
         else:
@@ -114,7 +123,7 @@ def open_url_in_browser(url: str) -> None:
         logger.error(f"Native browser open failed: {e}. Falling back to webbrowser.")
         try:
             import webbrowser
-            webbrowser.open(url)
+            webbrowser.open(url, new=2, autoraise=True)
         except Exception as e2:
             logger.error(f"Fallback webbrowser failed: {e2}")
 
@@ -286,6 +295,8 @@ class SkillsEngine:
             "whatsapp_message":  self._skill_whatsapp_message,
             "whatsapp_screenshot": self._skill_whatsapp_screenshot,
             "type_text":         self._skill_type_text,
+            "key_press":         self._skill_key_press,
+            "press_key":         self._skill_key_press,
             "quit_max":          self._skill_quit_max,  
             "email_send":        self._skill_email_send,
             "email_check":       self._skill_email_check,
@@ -306,6 +317,7 @@ class SkillsEngine:
             "kb_list":           self._skill_kb_list,
             "kb_stats":          self._skill_kb_stats,
             "deep_research":     self._skill_deep_research,
+            "research":          self._skill_research,
             "create_file":       self._skill_create_file,
             "schedule_action":   self._skill_schedule_action,
             # ── AI Orchestrator skills ──────────────────────────────────────
@@ -537,11 +549,14 @@ class SkillsEngine:
 
     def _skill_time_now(self) -> str:
         now = datetime.now()
-        return now.strftime("Time: %H:%M")
+        time_fmt = now.strftime("%I:%M %p").lstrip('0')
+        day_fmt = now.strftime("%A")
+        return f"It is {time_fmt} on {day_fmt}."
 
     def _skill_date_today(self) -> str:
         today = datetime.now()
-        return today.strftime("Date: %Y-%m-%d")
+        date_fmt = today.strftime("%A, %B %d, %Y")
+        return f"Today is {date_fmt}."
 
     def _skill_sysinfo(self, detail: str = "all") -> str:
         from modules.sysinfo import get_system_info
@@ -900,11 +915,34 @@ class SkillsEngine:
 
     def _skill_list_windows(self, *args) -> str:
         try:
-            import pygetwindow as gw
-            titles = [t for t in gw.getAllTitles() if t.strip()]
-            return "Open windows: " + ", ".join(titles[:10]) if titles else "No active windows."
-        except ImportError:
-            return "pygetwindow needed"
+            titles = []
+            try:
+                import pygetwindow as gw
+                titles = [t for t in gw.getAllTitles() if t.strip() and t.strip() not in ['Program Manager', 'Settings']]
+            except Exception:
+                pass
+
+            if titles:
+                return f"Open windows ({len(titles)}): " + ", ".join(titles[:10])
+
+            # Fallback to psutil for running GUI applications
+            import psutil
+            apps = set()
+            for proc in psutil.process_iter(['name']):
+                try:
+                    name = proc.info['name']
+                    if name and name.lower().endswith('.exe'):
+                        base = name[:-4].lower()
+                        if base in ['chrome', 'msedge', 'firefox', 'code', 'spotify', 'notepad', 'explorer', 'discord', 'slack', 'whatsapp']:
+                            apps.add(base.capitalize())
+                except Exception:
+                    pass
+
+            if apps:
+                return f"Active applications running: " + ", ".join(sorted(apps))
+            return "No active windows found."
+        except Exception as e:
+            return f"Window listing failed: {e}"
 
     async def _skill_screenshot(self, filename: str = "", location: str = "default", **kw) -> str:
         try:
@@ -1123,6 +1161,26 @@ class SkillsEngine:
     # MULTI-APP OPENER
     # ════════════════════════════════════════════
 
+    _WEB_DIRECT: Dict[str, str] = {
+        "google": "https://www.google.com",
+        "google.com": "https://www.google.com",
+        "youtube": "https://www.youtube.com",
+        "youtube.com": "https://www.youtube.com",
+        "chatgpt": "https://chatgpt.com",
+        "gemini": "https://gemini.google.com",
+        "github": "https://github.com",
+        "instagram": "https://www.instagram.com",
+        "facebook": "https://www.facebook.com",
+        "twitter": "https://x.com",
+        "x": "https://x.com",
+        "linkedin": "https://www.linkedin.com",
+        "reddit": "https://www.reddit.com",
+        "gmail": "https://mail.google.com",
+        "maps": "https://maps.google.com",
+        "drive": "https://drive.google.com",
+        "whatsapp web": "https://web.whatsapp.com",
+    }
+
     _WIN_PROTOCOLS: Dict[str, str] = {
         "whatsapp": "whatsapp:", "spotify": "spotify:", "discord": "discord:",
         "teams": "msteams:", "ms-teams": "msteams:", "microsoft teams": "msteams:",
@@ -1134,10 +1192,10 @@ class SkillsEngine:
         "terminal": "wt.exe", "windows terminal": "wt.exe", "powershell": "powershell.exe",
         "explorer": "explorer.exe", "file explorer": "explorer.exe",
         "task manager": "taskmgr.exe", "taskmgr": "taskmgr.exe",
-        "chrome": "start opera", "google chrome": "start chrome", "firefox": "start firefox",
+        "chrome": "start chrome", "google chrome": "start chrome", "firefox": "start firefox",
         "edge": "start msedge", "brave": "start brave", "opera": "start opera",
-        "browser": "start opera", "default browser": "start opera",
-        "my browser": "start opera", "web browser": "start opera",
+        "browser": "start chrome", "default browser": "start chrome",
+        "my browser": "start chrome", "web browser": "start chrome",
         "vscode": "code", "vs code": "code", "visual studio code": "code",
         "word": "start winword", "excel": "start excel", "powerpoint": "start powerpnt",
         "outlook": "start outlook", "vlc": "start vlc", "obs": "start obs64",
@@ -1169,11 +1227,22 @@ class SkillsEngine:
 
         results = []
         for app in apps_to_open:
-            app_name = app.strip()
-            if not app_name: continue
+            app_raw = app.strip()
+            if not app_raw: continue
             
+            # Clean trailing filler words ("for me", "please", "karo", "kholo", "do", "de", "na", "pls")
+            app_clean = re.sub(r'\b(for me|for us|please|pls|now|karo|kholo|khol|do|de|na|bhai)\b', '', app_raw, flags=re.IGNORECASE).strip()
+            app_name = app_clean if app_clean else app_raw
             app_lower = app_name.lower()
             success = False
+
+            # 0. Check if this is a known direct website (google, youtube, chatgpt, etc.)
+            direct_url = self._WEB_DIRECT.get(app_lower)
+            if direct_url:
+                open_url_in_browser(direct_url)
+                results.append(f"{app_name.capitalize()} opened in browser.")
+                success = True
+                continue
 
             # Check if this app request is actually an explicit web URL/domain
             is_web = (
@@ -1637,6 +1706,17 @@ class SkillsEngine:
             return "Typed."
         except Exception as e:
             return f"Typing failed: {e}"
+
+    def _skill_key_press(self, key_name: str = "enter", *args) -> str:
+        if not PYAUTOGUI_AVAILABLE:
+            return "Key press needs: pip install pyautogui"
+        key = (key_name or "enter").lower().strip()
+        try:
+            time.sleep(0.5)
+            pyautogui.press(key)
+            return f"Pressed {key}."
+        except Exception as e:
+            return f"Key press failed: {e}"
 
     def _skill_system_shutdown(self, delay: str = "30", **kw) -> str:
         try:
