@@ -288,56 +288,6 @@ class ReminderScheduler:
             logger.error(f"ReminderScheduler: TTS failed — {e}")
 
 
-# ══════════════════════════════════════════════════════
-# ENHANCED REMINDER SKILL METHODS
-# Drop these into skills.py, replacing existing reminder methods.
-# All three use ReminderStore directly.
-# ══════════════════════════════════════════════════════
-
-def skill_reminder_set(config, *args) -> str:
-    """
-    Args: time, reminder_text
-    Example tag: [SKILL:reminder_set:1:00pm:mujhe xyz kaam karna hai]
-    """
-    if len(args) < 2:
-        return (
-            "Usage: reminder_set:TIME:TEXT — "
-            "Example: reminder_set:1:00pm:submit assignment"
-        )
-
-    time_str = args[0].strip()
-    text     = " ".join(args[1:]).strip()
-
-    if not text:
-        return "Reminder text nahi diya bhai."
-
-    store = ReminderStore(config)
-    return store.add(time_str, text)
-
-
-def skill_reminder_list(config, *args) -> str:
-    """Lists all pending (not yet fired) reminders."""
-    store   = ReminderStore(config)
-    pending = store.list_pending()
-
-    if not pending:
-        return "Koi pending reminder nahi hai boss."
-
-    lines = []
-    for r in pending:
-        dt = datetime.fromisoformat(r["datetime"])
-        lines.append(f"• {dt.strftime('%d %b %I:%M %p')} — {r['text']}")
-
-    return f"Tere {len(pending)} pending reminders:\n" + "\n".join(lines)
-
-
-def skill_reminder_clear(config, *args) -> str:
-    """Clears all pending reminders."""
-    store     = ReminderStore(config)
-    reminders = store._read()
-    store._write([r for r in reminders if r["fired"]])
-    return "Sab pending reminders clear kar diye boss."
-
 
 # ══════════════════════════════════════════════════════
 # Singleton
