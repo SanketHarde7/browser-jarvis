@@ -22,12 +22,45 @@ def get_project_root() -> Path:
 
 PROJECT_ROOT = get_project_root()
 
-env_file = PROJECT_ROOT / "backend" / ".env"
-if env_file.exists():
-    load_dotenv(dotenv_path=str(env_file), override=True)
-    logger.info(f"✅ .env loaded from: {env_file}")
-else:
-    load_dotenv(override=True)
+env_file = PROJECT_ROOT / ".env"
+
+
+def _load_env_safe(filepath: Path) -> None:
+    """Load .env robustly: strip BOM, skip invalid keys, handle encoding."""
+    if not filepath.exists():
+        load_dotenv(override=True)
+        return
+
+    # Read raw bytes and strip UTF-8 BOM if present
+    raw = filepath.read_bytes()
+    if raw.startswith(b"\xef\xbb\xbf"):
+        raw = raw[3:]
+
+    content = raw.decode("utf-8", errors="replace")
+
+    for line in content.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip()
+        # Skip keys with non-ASCII or null characters (corrupted entries)
+        if not key or not key.isidentifier():
+            logger.warning(f"Skipping invalid .env key: {repr(key)}")
+            continue
+        try:
+            os.environ[key] = value
+        except OSError:
+            logger.warning(f"Could not set env var: {repr(key)} (OSError)")
+
+    logger.info(f".env loaded from: {filepath}")
+
+
+_load_env_safe(env_file)
+
 
 
 class Config:
@@ -38,7 +71,14 @@ class Config:
     PORT: int = int(os.getenv("PORT", "8000"))
     SKILLS_ENABLED: bool = True
     COUNTING_PAUSE: float = float(os.getenv("COUNTING_PAUSE", "0.8"))
-    WS_AUTH_TOKEN: str = os.getenv("WS_AUTH_TOKEN", "")
+    WS_AUTH_TOKEN: str = os.getenv("WS_AUTH_TOKEN") or os.getenv("VITE_WS_AUTH_TOKEN", "")
+
+    # ── Security ──
+    MAX_WS_CONNECTIONS: int = int(os.getenv("MAX_WS_CONNECTIONS", "5"))
+    AUTH_RATE_LIMIT_WINDOW: int = int(os.getenv("AUTH_RATE_LIMIT_WINDOW", "60"))   # seconds
+    AUTH_RATE_LIMIT_MAX: int = int(os.getenv("AUTH_RATE_LIMIT_MAX", "5"))           # max failures per window
+    AUTH_BAN_DURATION: int = int(os.getenv("AUTH_BAN_DURATION", "300"))             # ban duration seconds
+    WS_MAX_PAYLOAD_BYTES: int = int(os.getenv("WS_MAX_PAYLOAD_BYTES", str(10 * 1024 * 1024)))  # 10MB
 
     # ── Paths ──
     PROJECT_ROOT: Path = PROJECT_ROOT
@@ -187,7 +227,7 @@ class Config:
         "paint": "mspaint.exe", "cmd": "cmd.exe",
         "terminal": "wt.exe", "powershell": "powershell.exe",
         "explorer": "explorer.exe", "task manager": "taskmgr.exe",
-        "chrome": "start chrome", "firefox": "start firefox",
+        "chrome": "start chrome", "google": "start chrome https://google.com", "google layer": "start chrome https://google.com", "firefox": "start firefox",
         "edge": "start msedge", "brave": "start brave",
         "vscode": "code", "vs code": "code", "code": "code",
         "word": "start winword", "excel": "start excel",
@@ -238,14 +278,6 @@ class Config:
         if not keys:
             raise ValueError("No GROQ_API_KEY found. Check your .env file.")
         return keys[self._current_key_idx % len(keys)]
-
-    def rotate_api_key(self) -> bool:
-        keys = self.GROQ_API_KEYS
-        if len(keys) <= 1:
-            return False
-        self._current_key_idx = (self._current_key_idx + 1) % len(keys)
-        logger.info(f"🔄 API Key rotated → index {self._current_key_idx}")
-        return True
 
     # ── AI Orchestrator ──
     AI_ORCHESTRATOR_ENABLED: bool = True
