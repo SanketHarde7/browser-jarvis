@@ -202,9 +202,9 @@ export function useVoice({ onAudioReady, onError, onSpeechStart }: UseVoiceOptio
         // Strict Silero parameters for high noise rejection
         // Higher threshold = requires more confidence that it's actual speech
         positiveSpeechThreshold: 0.80,
-        negativeSpeechThreshold: 0.55,
-        minSpeechMs: 400,
-        redemptionMs: 500,
+        negativeSpeechThreshold: 0.45,
+        minSpeechMs: 500,
+        redemptionMs: 1000,
       } as any);
       
       vadRef.current = myvad;
