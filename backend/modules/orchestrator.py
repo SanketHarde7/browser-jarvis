@@ -10,8 +10,17 @@ logger = logging.getLogger("MAX.ORCHESTRATOR")
 DIRECT = "DIRECT"
 NEEDS_APPROVAL = "NEEDS_APPROVAL"
 
-_COMPLEX_PATTERNS = [r"\bresearch\b", r"\bdeep research\b", r"\bresearch .* thoroughly\b", r"\bcompare\b.*\b(across|sources|websites)\b", r"\bkeep digging\b", r"\bfull understanding\b", r"\bbuild and test\b", r"\bcomprehensive\b", r"\buntil .* accurate\b", r"\bstudy\b.*\bdeeply\b"]
 _DIRECT_PATTERNS = [r"\b(open|close|timer|volume|brightness|screenshot|read screen|play|pause|note|weather|time)\b"]
+
+_DEEP_RESEARCH_PATTERNS = [
+    r"\bdeep research\b",
+    r"\bdo (a )?deep research\b",
+    r"\bresearch .* deeply\b",
+    r"\bresearch .* thoroughly\b",
+    r"\bcomprehensive research report\b",
+    r"\borchestrator mode\b",
+    r"\bdeep orchestrator\b",
+]
 _APPROVAL_YES = {"yes","deep","orchestrator","go deep","use orchestrator","haan","ha","ok","okay","kar do","approve"}
 _APPROVAL_NO = {"no","normal","direct","nahi","mat karo","best effort"}
 
@@ -19,11 +28,26 @@ _pending_approvals: Dict[str, Dict[str, Any]] = {}
 _running_tasks: Dict[str, asyncio.Task] = {}
 
 async def classify_complexity(query: str, context: str = "") -> str:
+    """
+    Intelligent complexity classifier.
+    Only triggers deep mode approval prompt for EXPLICIT deep multi-source research tasks.
+    Casual questions or queries containing the word 'research' proceed in DIRECT normal mode.
+    """
     q = (query or "").lower().strip()
-    if any(re.search(p, q) for p in _COMPLEX_PATTERNS): return NEEDS_APPROVAL
-    signals = sum(bool(w in q) for w in ["research", "thorough", "multiple", "sources", "verify", "write report", "long", "detailed"])
-    if signals >= 2: return NEEDS_APPROVAL
-    if any(re.search(p, q) for p in _DIRECT_PATTERNS): return DIRECT
+    
+    # Direct single-shot override
+    if any(re.search(p, q) for p in _DIRECT_PATTERNS):
+        return DIRECT
+
+    # Check for explicit deep research intent
+    if any(re.search(p, q) for p in _DEEP_RESEARCH_PATTERNS):
+        return NEEDS_APPROVAL
+
+    # Requires multiple strong signals (e.g. "deep", "thorough", "multi-source report")
+    deep_signals = sum(bool(w in q) for w in ["deep research", "thoroughly", "multiple sources", "detailed report", "comprehensive report"])
+    if deep_signals >= 2:
+        return NEEDS_APPROVAL
+
     return DIRECT
 
 def approval_reply_kind(text: str) -> str:
