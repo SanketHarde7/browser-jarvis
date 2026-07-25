@@ -1,6 +1,12 @@
+/**
+ * 🎙️ Input Bar — Frosted glass input with mic/send toggle
+ * Uses glass-3 tier for elevated depth feel
+ */
 import { useRef, useState } from 'react'
 import { ImagePlus, Mic, Send } from 'lucide-react'
 import { AnimatePresence, motion } from 'framer-motion'
+
+const btnTransition = { type: 'spring', stiffness: 400, damping: 25 }
 
 export default function InputBar({
   onSendText,
@@ -40,7 +46,7 @@ export default function InputBar({
   }
 
   return (
-    <form className="input-bar glass" onSubmit={submit}>
+    <form className="input-bar" onSubmit={submit}>
       <input
         ref={fileInputRef}
         type="file"
@@ -56,7 +62,7 @@ export default function InputBar({
         disabled={disabled}
         onClick={() => fileInputRef.current?.click()}
       >
-        <ImagePlus size={18} strokeWidth={1.8} />
+        <ImagePlus size={19} strokeWidth={1.7} />
       </button>
 
       <label className="input-field-wrap">
@@ -74,20 +80,21 @@ export default function InputBar({
         {canSubmit ? (
           <motion.button
             key="send"
-            className="mic-button send-button"
+            className="mic-btn send-btn"
             type="submit"
             disabled={disabled}
-            initial={{ scale: 0.82, opacity: 0 }}
+            initial={{ scale: 0.8, opacity: 0 }}
             animate={{ scale: 1, opacity: 1 }}
-            exit={{ scale: 0.82, opacity: 0 }}
+            exit={{ scale: 0.8, opacity: 0 }}
+            transition={btnTransition}
             aria-label="Send message"
           >
-            <Send size={18} fill="currentColor" />
+            <Send size={17} fill="currentColor" />
           </motion.button>
         ) : (
           <motion.button
             key="mic"
-            className={`mic-button ${isRecording ? 'recording' : ''} state-${state}`}
+            className={`mic-btn ${isRecording ? 'recording' : ''}`}
             type="button"
             disabled={disabled}
             onPointerDown={(event) => {
@@ -102,12 +109,13 @@ export default function InputBar({
             onPointerLeave={() => {
               if (isRecording) onMicRelease?.()
             }}
-            initial={{ scale: 0.82, opacity: 0 }}
+            initial={{ scale: 0.8, opacity: 0 }}
             animate={{ scale: 1, opacity: 1 }}
-            exit={{ scale: 0.82, opacity: 0 }}
+            exit={{ scale: 0.8, opacity: 0 }}
+            transition={btnTransition}
             aria-label={isRecording ? 'Release to send voice message' : 'Hold to speak'}
           >
-            <Mic size={21} strokeWidth={2.1} />
+            <Mic size={21} strokeWidth={2} />
           </motion.button>
         )}
       </AnimatePresence>
