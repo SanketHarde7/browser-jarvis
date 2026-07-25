@@ -21,7 +21,8 @@
 
 import { useEffect, useRef, useCallback } from "react";
 
-const WS_URL  = "ws://127.0.0.1:8000/ws";
+const WS_AUTH_TOKEN = import.meta.env.VITE_WS_AUTH_TOKEN || "";
+const WS_URL  = `ws://127.0.0.1:8000/ws?token=${WS_AUTH_TOKEN}&device=laptop`;
 const MAX_RECONNECT_DELAY_MS = 30_000;
 
 export type BackendStatus = "connecting" | "connected" | "disconnected" | "offline";
