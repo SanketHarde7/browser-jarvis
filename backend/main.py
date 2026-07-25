@@ -8,9 +8,21 @@ Added: /api/wake-check endpoint for wake word detection.
 import os
 import sys
 import logging
+
+try:
+    if hasattr(sys.stdout, 'reconfigure'):
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    if hasattr(sys.stderr, 'reconfigure'):
+        sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+except Exception:
+    pass
+
 import base64
 import re
 import uuid
+import time as _time_module
+import hmac
+from collections import defaultdict
 from pathlib import Path
 from datetime import datetime
 from typing import Optional, Dict, Any, List
@@ -19,7 +31,7 @@ from typing import Optional, Dict, Any, List
 _last_voice_ts = 0.0
 _last_voice_text = ""
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, Form
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, Form, Header, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uvicorn
@@ -85,13 +97,91 @@ app = FastAPI(
     version="4.2.0",
 )
 
+# ── CORS — locked to known local origins only ──
+_ALLOWED_ORIGINS = [
+    "http://localhost",
+    "http://localhost:5173",
+    "http://localhost:5174",
+    "http://localhost:3000",
+    "http://127.0.0.1",
+    "http://127.0.0.1:5173",
+    "http://127.0.0.1:5174",
+    "http://127.0.0.1:3000",
+    "http://127.0.0.1:8000",
+    "tauri://localhost",
+    "https://tauri.localhost",
+    "capacitor://localhost",
+    "http://localhost:8100",
+]
+# Add phone/LAN IPs dynamically from env
+_extra_origins = os.getenv("CORS_EXTRA_ORIGINS", "")
+if _extra_origins:
+    _ALLOWED_ORIGINS.extend([o.strip() for o in _extra_origins.split(",") if o.strip()])
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ═══════════════════════════════════════════════════
+# SECURITY — Rate Limiting, Auth, Connection Tracking
+# ═══════════════════════════════════════════════════
+
+# Track failed auth attempts per IP: {ip: [timestamp, ...]}
+_auth_failures: Dict[str, list] = defaultdict(list)
+# Track banned IPs: {ip: ban_expiry_timestamp}
+_banned_ips: Dict[str, float] = {}
+# Active WebSocket connection count
+_active_ws_count = 0
+
+
+def _is_ip_banned(ip: str) -> bool:
+    """Check if an IP is currently banned from auth failures."""
+    if ip in _banned_ips:
+        if _time_module.time() < _banned_ips[ip]:
+            return True
+        else:
+            del _banned_ips[ip]  # Ban expired
+    return False
+
+
+def _record_auth_failure(ip: str):
+    """Record a failed auth attempt and ban IP if threshold exceeded."""
+    now = _time_module.time()
+    window = config.AUTH_RATE_LIMIT_WINDOW
+    # Prune old entries outside the window
+    _auth_failures[ip] = [t for t in _auth_failures[ip] if now - t < window]
+    _auth_failures[ip].append(now)
+    if len(_auth_failures[ip]) >= config.AUTH_RATE_LIMIT_MAX:
+        _banned_ips[ip] = now + config.AUTH_BAN_DURATION
+        logger.warning(f"🔒 IP {ip} BANNED for {config.AUTH_BAN_DURATION}s after {len(_auth_failures[ip])} failed auth attempts")
+        _auth_failures[ip].clear()
+
+
+def _constant_time_compare(a: str, b: str) -> bool:
+    """Timing-safe string comparison to prevent timing attacks."""
+    return hmac.compare_digest(a.encode(), b.encode())
+
+
+async def verify_token(authorization: str = Header(None)):
+    """
+    FastAPI dependency to protect REST endpoints.
+    Expects: Authorization: Bearer <token>
+    If WS_AUTH_TOKEN is not set, all requests pass (dev mode).
+    """
+    if not config.WS_AUTH_TOKEN:
+        return True  # No token configured = dev mode, allow all
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Authorization header required")
+    parts = authorization.split(" ", 1)
+    if len(parts) != 2 or parts[0].lower() != "bearer":
+        raise HTTPException(status_code=401, detail="Invalid authorization format. Use: Bearer <token>")
+    if not _constant_time_compare(parts[1], config.WS_AUTH_TOKEN):
+        raise HTTPException(status_code=403, detail="Invalid token")
+    return True
 
 
 @app.on_event("startup")
@@ -292,7 +382,7 @@ class ClipboardRequest(BaseModel):
 WAKE_PHRASES = ["hey max", "hello max", "ok max", "max", "hi max", "oye max"]
 
 @app.post("/api/wake-check")
-async def wake_check(request: WakeCheckRequest):
+async def wake_check(request: WakeCheckRequest, _auth=Depends(verify_token)):
     """
     Lightweight wake word verification.
     Takes audio, runs STT with auto language detect, checks for wake phrases.
@@ -370,11 +460,11 @@ async def process_voice_request(
         logger.info(f"STT: {transcript}")
         
         req_device = connection_state.get("device", "laptop")
-        from agent_core import get_active_device, set_active_device, get_active_websockets
+        from agent_core import get_active_device, set_active_device, get_active_websockets, is_device_match
         
         # ── STRICT DEVICE LOCK ──
         # Only process voice from the explicitly active device.
-        if req_device != get_active_device():
+        if not is_device_match(req_device, get_active_device()):
             logger.warning(f"Rejecting voice from {req_device} because active device is {get_active_device()}.")
             return
 
@@ -391,11 +481,12 @@ async def process_voice_request(
         # Intercept conversational follow-ups like "Haan", "Open", "Kholo", "Yes"
         words_count = len(lower_trans.split())
         follow_up_phrases = {"haan", "open", "kholo", "yes", "khol", "open it", "haan kholo", "khol do", "khol de", "open this", "yup", "yeah", "sure"}
+        target_names = {"google", "youtube", "notepad", "chrome", "calc", "calculator", "browser", "vscode", "vs code", "github", "chatgpt", "gemini"}
         is_follow_up = False
-        if words_count <= 4:
+        if words_count <= 4 and not any(t in lower_trans for t in target_names):
             if lower_trans in follow_up_phrases:
                 is_follow_up = True
-            elif any(w in lower_trans for w in ["haan", "yes", "yup", "yeah", "sure", "please"]) and any(w in lower_trans for w in ["open", "khol"]):
+            elif any(w in lower_trans for w in ["haan", "yes", "yup", "yeah", "sure"]) and any(w in lower_trans for w in ["open", "khol"]):
                 is_follow_up = True
         
         intercepted = False
@@ -448,6 +539,11 @@ async def process_voice_request(
         
         if connection_state["current_request_id"] != rid:
             logger.info(f"Voice task {rid} discarded before sending response.")
+            return
+
+        # ── Check for device switch intent ──
+        if result.get("intent") == "device_switch":
+            logger.info("Device switch executed. Target device notified directly.")
             return
 
         # ── Check for reserved listening state commands ──
@@ -508,20 +604,38 @@ async def process_voice_request(
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket, token: str = None, device: str = "laptop"):
-    if config.WS_AUTH_TOKEN and token != config.WS_AUTH_TOKEN:
-        logger.warning(f"Unauthorized WebSocket connection attempt from {websocket.client}")
+    global _active_ws_count
+    client_ip = websocket.client.host if websocket.client else "unknown"
+
+    # 1. Check if IP is banned from too many auth failures
+    if _is_ip_banned(client_ip):
+        logger.warning(f"🚫 Blocked banned IP {client_ip} from connecting")
         await websocket.close(code=1008)
         return
 
+    # 2. Verify auth token (timing-safe comparison)
+    if config.WS_AUTH_TOKEN and not _constant_time_compare(token or "", config.WS_AUTH_TOKEN):
+        logger.warning(f"Unauthorized WebSocket connection attempt from {client_ip}")
+        _record_auth_failure(client_ip)
+        await websocket.close(code=1008)
+        return
+
+    # 3. Enforce max concurrent connection limit
+    if _active_ws_count >= config.MAX_WS_CONNECTIONS:
+        logger.warning(f"Connection limit reached ({config.MAX_WS_CONNECTIONS}). Rejecting {client_ip}")
+        await websocket.close(code=1013)  # 1013 = Try Again Later
+        return
+
+    _active_ws_count += 1
     await websocket.accept()
-    logger.info(f"Client connected: {websocket.client} as {device}")
+    logger.info(f"Client connected: {client_ip} as {device} (active: {_active_ws_count}/{config.MAX_WS_CONNECTIONS})")
 
     global main_loop
     main_loop = asyncio.get_running_loop()
     
     # Register globals in agent_core so acknowledgements can be sent
     from agent_core import register_websocket, unregister_websocket, set_active_device
-    register_websocket(websocket, main_loop)
+    register_websocket(websocket, main_loop, device)
 
     connection_state = {
         "active_task": None,
@@ -535,13 +649,20 @@ async def websocket_endpoint(websocket: WebSocket, token: str = None, device: st
     try:
         while True:
             try:
-                msg = await websocket.receive_json()
+                raw_data = await websocket.receive_text()
+                # Input size validation
+                if len(raw_data) > config.WS_MAX_PAYLOAD_BYTES:
+                    logger.warning(f"Oversized payload from {client_ip}: {len(raw_data)} bytes (max {config.WS_MAX_PAYLOAD_BYTES})")
+                    await websocket.send_json({"event": "error", "message": "Payload too large"})
+                    continue
+                import json as _json
+                msg = _json.loads(raw_data)
             except WebSocketDisconnect:
                 raise
             except Exception as e:
-                logger.error(f"WebSocket receive error: {e}", exc_info=True)
+                logger.error(f"WebSocket receive error from {client_ip}: {type(e).__name__}")
                 try:
-                    await websocket.send_json({"event": "error", "message": "Backend Error: invalid payload"})
+                    await websocket.send_json({"event": "error", "message": "Invalid payload format"})
                 except Exception:
                     pass
                 continue
@@ -642,6 +763,10 @@ async def websocket_endpoint(websocket: WebSocket, token: str = None, device: st
 
                     result = await agent.process_text_input(user_text, use_tts=True, input_source="text")
                     
+                    if result.get("intent") == "device_switch":
+                        logger.info("Device switch executed via text. Target device notified directly.")
+                        continue
+
                     # ── Check for reserved listening state commands ──
                     if result.get("intent") == "reserved":
                         cmd = result.get("skill_used", "").replace("reserved:", "")
@@ -798,22 +923,24 @@ async def websocket_endpoint(websocket: WebSocket, token: str = None, device: st
                         active_task.cancel()
                         logger.info(f"Canceled active task via abort event for command ID: {connection_state.get('current_request_id')}")
             except Exception as e:
-                logger.error(f"WebSocket message error: {e}", exc_info=True)
+                logger.error(f"WebSocket message error: {type(e).__name__}: {e}", exc_info=True)
                 try:
-                    await websocket.send_json({"event": "error", "message": f"Backend Error: {str(e)}"})
+                    await websocket.send_json({"event": "error", "message": "An internal error occurred. Please try again."})
                 except Exception:
                     pass
                 continue
 
     except WebSocketDisconnect:
-        logger.info("Client disconnected")
+        logger.info(f"Client disconnected: {client_ip}")
     except Exception as e:
-        logger.error(f"WebSocket error: {e}")
+        logger.error(f"WebSocket error for {client_ip}: {type(e).__name__}: {e}")
         try:
-            await websocket.send_json({"event": "error", "message": f"Backend Error: {str(e)}"})
+            await websocket.send_json({"event": "error", "message": "Connection error. Please reconnect."})
         except Exception:
             pass
     finally:
+        _active_ws_count = max(0, _active_ws_count - 1)
+        logger.info(f"Connection closed for {client_ip} (active: {_active_ws_count}/{config.MAX_WS_CONNECTIONS})")
         try:
             from agent_core import unregister_websocket
             unregister_websocket(websocket)
@@ -854,7 +981,7 @@ async def health_check():
 # ═══════════════════════════════════════════════════
 
 @app.post("/api/speak")
-async def speak(request: TextInput):
+async def speak(request: TextInput, _auth=Depends(verify_token)):
     tts_path = await generate_tts(request.text[:3000])
     if tts_path and os.path.exists(tts_path):
         with open(tts_path, "rb") as f:
@@ -862,14 +989,14 @@ async def speak(request: TextInput):
     return {"error": "TTS generation failed boss."}
 
 @app.post("/api/listen")
-async def listen(audio_path: str = ""):
+async def listen(audio_path: str = "", _auth=Depends(verify_token)):
     if not audio_path:
         return {"error": "Audio file path do boss."}
     transcript = await transcribe_file(audio_path)
     return {"transcript": transcript}
 
 @app.post("/api/voice")
-async def voice(request: VoiceRequest):
+async def voice(request: VoiceRequest, _auth=Depends(verify_token)):
     agent = get_agent()
     transcript = await transcribe_audio(request.audio)
     
@@ -905,19 +1032,19 @@ async def voice(request: VoiceRequest):
 # ═══════════════════════════════════════════════════
 
 @app.get("/api/files/search")
-async def search_files(query: str = Query(...)):
+async def search_files(query: str = Query(...), _auth=Depends(verify_token)):
     skills = get_skills_engine(config)
     result = skills._skill_search_files(query)
     return {"result": result}
 
 @app.get("/api/files/list")
-async def list_files(folder: str = Query(".")):
+async def list_files(folder: str = Query("."), _auth=Depends(verify_token)):
     skills = get_skills_engine(config)
     result = skills._skill_list_files(folder)
     return {"result": result}
 
 @app.get("/api/files/read")
-async def read_file_api(filepath: str = Query(...)):
+async def read_file_api(filepath: str = Query(...), _auth=Depends(verify_token)):
     skills = get_skills_engine(config)
     result = skills._skill_read_file(filepath)
     return {"result": result}
@@ -928,19 +1055,19 @@ async def read_file_api(filepath: str = Query(...)):
 # ═══════════════════════════════════════════════════
 
 @app.post("/api/screenshot")
-async def screenshot(filename: str = ""):
+async def screenshot(filename: str = "", _auth=Depends(verify_token)):
     skills = get_skills_engine(config)
     result = skills._skill_screenshot(filename)
     return {"result": result}
 
 @app.post("/api/screen/record")
-async def screen_record():
+async def screen_record(_auth=Depends(verify_token)):
     skills = get_skills_engine(config)
     result = skills._skill_screen_record()
     return {"result": result}
 
 @app.post("/api/screen/read")
-async def read_screen(window: str = ""):
+async def read_screen(window: str = "", _auth=Depends(verify_token)):
     skills = get_skills_engine(config)
     result = await skills._skill_read_screen(window)
     return {"result": result}
@@ -951,55 +1078,55 @@ async def read_screen(window: str = ""):
 # ═══════════════════════════════════════════════════
 
 @app.post("/api/volume")
-async def volume(request: VolumeRequest):
+async def volume(request: VolumeRequest, _auth=Depends(verify_token)):
     skills = get_skills_engine(config)
     result = skills._skill_volume_control(request.action, str(request.value))
     return {"result": result}
 
 @app.post("/api/open-app")
-async def open_app(request: OpenAppRequest):
+async def open_app(request: OpenAppRequest, _auth=Depends(verify_token)):
     skills = get_skills_engine(config)
     result = skills._skill_open_app(request.app_name)
     return {"result": result}
 
 @app.post("/api/open-url")
-async def open_url(request: OpenUrlRequest):
+async def open_url(request: OpenUrlRequest, _auth=Depends(verify_token)):
     skills = get_skills_engine(config)
     result = skills._skill_web_open(request.url)
     return {"result": result}
 
 @app.post("/api/whatsapp")
-async def whatsapp(request: WhatsAppRequest):
+async def whatsapp(request: WhatsAppRequest, _auth=Depends(verify_token)):
     skills = get_skills_engine(config)
     result = skills._skill_whatsapp_message(request.contact, request.message)
     return {"result": result}
 
 @app.post("/api/type-text")
-async def type_text(request: TypeTextRequest):
+async def type_text(request: TypeTextRequest, _auth=Depends(verify_token)):
     skills = get_skills_engine(config)
     result = skills._skill_type_text(request.text)
     return {"result": result}
 
 @app.post("/api/timer")
-async def timer(request: TimerRequest):
+async def timer(request: TimerRequest, _auth=Depends(verify_token)):
     skills = get_skills_engine(config)
     result = skills._skill_timer(str(request.seconds), request.label)
     return {"result": result}
 
 @app.get("/api/weather")
-async def weather(city: str = Query("auto")):
+async def weather(city: str = Query("auto"), _auth=Depends(verify_token)):
     skills = get_skills_engine(config)
     result = skills._skill_weather(city)
     return {"result": result}
 
 @app.post("/api/shutdown")
-async def shutdown(request: ShutdownRequest):
+async def shutdown(request: ShutdownRequest, _auth=Depends(verify_token)):
     skills = get_skills_engine(config)
     result = skills._skill_system_shutdown(str(request.delay))
     return {"result": result}
 
 @app.post("/api/restart")
-async def restart(request: RestartRequest):
+async def restart(request: RestartRequest, _auth=Depends(verify_token)):
     skills = get_skills_engine(config)
     result = skills._skill_system_restart(str(request.delay))
     return {"result": result}
@@ -1010,31 +1137,31 @@ async def restart(request: RestartRequest):
 # ═══════════════════════════════════════════════════
 
 @app.post("/api/generate-code")
-async def generate_code(request: CodeRequest):
+async def generate_code(request: CodeRequest, _auth=Depends(verify_token)):
     skills = get_skills_engine(config)
     result = await skills._skill_write_code(request.language, request.description)
     return {"result": result}
 
 @app.post("/api/run-code")
-async def run_code(request: RunCodeRequest):
+async def run_code(request: RunCodeRequest, _auth=Depends(verify_token)):
     skills = get_skills_engine(config)
     result = await skills._skill_run_code(request.filepath)
     return {"result": result}
 
 @app.post("/api/review-code")
-async def review_code(request: ReviewCodeRequest):
+async def review_code(request: ReviewCodeRequest, _auth=Depends(verify_token)):
     skills = get_skills_engine(config)
     result = await skills._skill_code_review(request.filepath)
     return {"result": result}
 
 @app.post("/api/fix-code")
-async def fix_code(request: FixCodeRequest):
+async def fix_code(request: FixCodeRequest, _auth=Depends(verify_token)):
     skills = get_skills_engine(config)
     result = await skills._skill_fix_code(request.filepath, request.issue)
     return {"result": result}
 
 @app.post("/api/project-scaffold")
-async def project_scaffold(request: ProjectScaffoldRequest):
+async def project_scaffold(request: ProjectScaffoldRequest, _auth=Depends(verify_token)):
     skills = get_skills_engine(config)
     result = await skills._skill_project_scaffold(request.project_type, request.project_name)
     return {"result": result}
@@ -1045,13 +1172,13 @@ async def project_scaffold(request: ProjectScaffoldRequest):
 # ═══════════════════════════════════════════════════
 
 @app.post("/api/email/send")
-async def email_send(request: EmailSendRequest):
+async def email_send(request: EmailSendRequest, _auth=Depends(verify_token)):
     agent = get_email_agent()
     result = agent.send_email(request.to, request.subject, request.body)
     return {"result": result}
 
 @app.get("/api/email/check")
-async def email_check():
+async def email_check(_auth=Depends(verify_token)):
     agent = get_email_agent()
     result = agent.check_emails()
     return {"result": result}
@@ -1062,19 +1189,19 @@ async def email_check():
 # ═══════════════════════════════════════════════════
 
 @app.get("/api/calendar/today")
-async def calendar_today():
+async def calendar_today(_auth=Depends(verify_token)):
     agent = get_calendar_agent()
     result = agent.today()
     return {"result": result}
 
 @app.get("/api/calendar/week")
-async def calendar_week():
+async def calendar_week(_auth=Depends(verify_token)):
     agent = get_calendar_agent()
     result = agent.week()
     return {"result": result}
 
 @app.post("/api/calendar/add")
-async def calendar_add(request: CalendarAddRequest):
+async def calendar_add(request: CalendarAddRequest, _auth=Depends(verify_token)):
     agent = get_calendar_agent()
     result = agent.add_event(request.title, request.date, request.time)
     return {"result": result}
@@ -1085,25 +1212,25 @@ async def calendar_add(request: CalendarAddRequest):
 # ═══════════════════════════════════════════════════
 
 @app.post("/api/browser/open")
-async def browser_open(request: BrowserOpenRequest):
+async def browser_open(request: BrowserOpenRequest, _auth=Depends(verify_token)):
     agent = get_browser_agent()
     result = agent.open_url(request.url)
     return {"result": result}
 
 @app.post("/api/browser/click")
-async def browser_click(request: BrowserActionRequest):
+async def browser_click(request: BrowserActionRequest, _auth=Depends(verify_token)):
     agent = get_browser_agent()
     result = agent.click(request.selector)
     return {"result": result}
 
 @app.post("/api/browser/type")
-async def browser_type(request: BrowserActionRequest):
+async def browser_type(request: BrowserActionRequest, _auth=Depends(verify_token)):
     agent = get_browser_agent()
     result = agent.type_text(request.selector, request.text)
     return {"result": result}
 
 @app.post("/api/browser/scrape")
-async def browser_scrape(request: BrowserScrapeRequest):
+async def browser_scrape(request: BrowserScrapeRequest, _auth=Depends(verify_token)):
     agent = get_browser_agent()
     result = agent.scrape(request.url, request.query)
     return {"result": result}
@@ -1114,19 +1241,19 @@ async def browser_scrape(request: BrowserScrapeRequest):
 # ═══════════════════════════════════════════════════
 
 @app.post("/api/smarthome/fan")
-async def smarthome_fan(request: FanRequest):
+async def smarthome_fan(request: FanRequest, _auth=Depends(verify_token)):
     agent = get_smarthome_agent()
     result = agent.fan_control(request.action)
     return {"result": result}
 
 @app.post("/api/smarthome/light")
-async def smarthome_light(request: LightRequest):
+async def smarthome_light(request: LightRequest, _auth=Depends(verify_token)):
     agent = get_smarthome_agent()
     result = agent.light_control(request.action)
     return {"result": result}
 
 @app.post("/api/smarthome/ac")
-async def smarthome_ac(request: ACRequest):
+async def smarthome_ac(request: ACRequest, _auth=Depends(verify_token)):
     agent = get_smarthome_agent()
     result = agent.ac_control(request.action, request.value)
     return {"result": result}
@@ -1137,19 +1264,19 @@ async def smarthome_ac(request: ACRequest):
 # ═══════════════════════════════════════════════════
 
 @app.post("/api/pc/brightness")
-async def pc_brightness(request: BrightnessRequest):
+async def pc_brightness(request: BrightnessRequest, _auth=Depends(verify_token)):
     skills = get_skills_engine(config)
     result = skills._skill_brightness(request.action, str(request.value))
     return {"result": result}
 
 @app.post("/api/pc/clipboard")
-async def pc_clipboard(request: ClipboardRequest):
+async def pc_clipboard(request: ClipboardRequest, _auth=Depends(verify_token)):
     skills = get_skills_engine(config)
     result = skills._skill_clipboard(request.action, request.text)
     return {"result": result}
 
 @app.post("/api/pc/lock")
-async def pc_lock():
+async def pc_lock(_auth=Depends(verify_token)):
     skills = get_skills_engine(config)
     result = skills._skill_lock_pc()
     return {"result": result}
@@ -1160,13 +1287,13 @@ async def pc_lock():
 # ═══════════════════════════════════════════════════
 
 @app.get("/api/plugins/list")
-async def plugins_list():
+async def plugins_list(_auth=Depends(verify_token)):
     loader = get_plugin_loader()
     result = loader.list_plugins()
     return {"result": result}
 
 @app.post("/api/plugins/reload")
-async def plugins_reload():
+async def plugins_reload(_auth=Depends(verify_token)):
     loader = get_plugin_loader()
     loader.reload()
     skills = get_skills_engine(config)
@@ -1179,7 +1306,7 @@ async def plugins_reload():
 # ═══════════════════════════════════════════════════
 
 @app.post("/api/chat")
-async def chat(request: TextInput):
+async def chat(request: TextInput, _auth=Depends(verify_token)):
     agent = get_agent()
     result = await agent.process_text_input(request.text, use_tts=request.tts, input_source="text")
     response_data = {
@@ -1208,29 +1335,29 @@ class KBAddRequest(BaseModel):
     content: str
 
 @app.post("/api/kb/rebuild")
-async def kb_rebuild():
+async def kb_rebuild(_auth=Depends(verify_token)):
     kb = get_knowledge_base(config)
     result = kb.build_index()
     return {"result": result}
 
 @app.get("/api/kb/list")
-async def kb_list():
+async def kb_list(_auth=Depends(verify_token)):
     kb = get_knowledge_base(config)
     return {"result": kb.list_documents()}
 
 @app.get("/api/kb/stats")
-async def kb_stats():
+async def kb_stats(_auth=Depends(verify_token)):
     kb = get_knowledge_base(config)
     return {"result": kb.get_stats()}
 
 @app.get("/api/kb/search")
-async def kb_search(query: str = Query(...)):
+async def kb_search(query: str = Query(...), _auth=Depends(verify_token)):
     kb = get_knowledge_base(config)
     ctx = kb.query(query, top_k=5, min_similarity=0.20)
     return {"result": ctx or "No relevant results found."}
 
 @app.post("/api/kb/add")
-async def kb_add(request: KBAddRequest):
+async def kb_add(request: KBAddRequest, _auth=Depends(verify_token)):
     kb = get_knowledge_base(config)
     result = kb.add_document(request.filename, request.content)
     return {"result": result}
@@ -1240,18 +1367,40 @@ async def kb_add(request: KBAddRequest):
 # MAIN
 # ═══════════════════════════════════════════════════
 
+def _get_lan_ip():
+    import socket
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
+
 if __name__ == "__main__":
+    lan_ip = _get_lan_ip()
     logger.info(f"MAX v4.2 starting on {config.HOST}:{config.PORT}")
+    logger.info(f"   LAN IP: {lan_ip}")
+    logger.info(f"   📱 Mobile App Target: {lan_ip}:{config.PORT}")
     logger.info(f"   LLM: {config.LLM_MODEL}")
     logger.info(f"   TTS: {config.TTS_VOICE}")
     logger.info(f"   Skills: {len(get_skills_engine(config).skills_registry)} registered")
     logger.info(f"   Wake word: enabled")
 
-    uvicorn.run(
-        "main:app",
-        host=config.HOST,
-        port=config.PORT,
-        reload=config.DEBUG,
-        reload_excludes=["*.json", "data/*", "knowledge/*"],
-        log_level="info" if not config.DEBUG else "debug",
-    )
+    if config.DEBUG:
+        uvicorn.run(
+            "main:app",
+            host=config.HOST,
+            port=config.PORT,
+            reload=True,
+            reload_excludes=["*.json", "data/*", "knowledge/*"],
+            log_level="debug",
+        )
+    else:
+        uvicorn.run(
+            app,
+            host=config.HOST,
+            port=config.PORT,
+            log_level="info",
+        )
