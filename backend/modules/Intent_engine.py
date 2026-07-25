@@ -142,7 +142,11 @@ Respond ONLY with valid JSON. No other text.
 # FAST PATTERN PRE-CHECK
 # Catches obvious cases without any LLM call.
 # Only call LLM when truly ambiguous.
-# ═══════════════════════════════════════════════════
+# [PREVIOUS LOGIC PRESERVED]
+# _EXPLICIT_ACTION_PATTERNS = re.compile(
+#     r'\b(open|khol|kholo|launch|start|play|run|search|record|create|set|delete|send)\b',
+#     re.IGNORECASE
+# )
 
 _CAPABILITY_PATTERNS = re.compile(
     r'\b(can you|are you able|do you support|are you capable|kya tum kar sakte|'
@@ -165,20 +169,30 @@ _CONVERSATION_PATTERNS = re.compile(
     re.IGNORECASE
 )
 
+_ACTION_VERBS = {"open", "khol", "kholo", "play", "launch", "start", "run", "search", "record", "create", "set", "delete", "send"}
 
 def _fast_classify(text: str) -> Optional[Intent]:
     """
     Pattern-based fast path. Returns Intent if obvious, else None (→ use LLM).
-    This prevents unnecessary API calls for simple cases.
+    Dynamically differentiates capability questions from explicit action requests.
     """
     t = text.strip()
+    words = set(re.findall(r'\b\w+\b', t.lower()))
 
+    # If user uses capability phrasing BUT specifies an explicit action verb ("Can you open google?"), it's a COMMAND!
     if _CAPABILITY_PATTERNS.search(t):
+        if words.intersection(_ACTION_VERBS) and not _NEGATIVE_PATTERNS.search(t):
+            return Intent(
+                type=IntentType.COMMAND,
+                should_execute_skill=True,
+                confidence=0.98,
+                reason="capability phrasing with explicit action verb"
+            )
         return Intent(
             type=IntentType.CAPABILITY_QUESTION,
             should_execute_skill=False,
             confidence=0.97,
-            reason="capability keyword detected"
+            reason="pure capability question"
         )
 
     if _NEGATIVE_PATTERNS.search(t):
@@ -238,19 +252,27 @@ class IntentEngine:
             self._cache_put(cache_key, fast)
             return fast
 
-        # Layer 2: LLM classification
-        try:
-            intent = await asyncio.wait_for(self._llm_classify(text), timeout=10.0)
-        except asyncio.TimeoutError:
-            logger.warning(f"Intent classification timed out for: '{text[:60]}'. Defaulting to COMMAND.")
-            intent = self._default_intent("timeout")
-        except Exception as e:
-            logger.warning(f"Intent classification error: {e}. Defaulting to COMMAND.")
-            intent = self._default_intent(str(e))
-
-        logger.info(f"Intent (LLM): {intent.type.value} [{intent.confidence:.2f}] — '{text[:60]}'")
+        # Default to Single-Pass Main Agent Execution (0ms Overhead, 0 Extra LLM Calls)
+        # Main Agent handles skill selection and chat dynamically in a single pass.
+        intent = Intent(
+            type=IntentType.COMMAND,
+            should_execute_skill=True,
+            confidence=0.90,
+            reason="single-pass main agent delegation"
+        )
+        logger.info(f"Intent (Single-Pass): {intent.type.value} [{intent.confidence:.2f}] — '{text[:60]}'")
         self._cache_put(cache_key, intent)
         return intent
+
+        # [PREVIOUS LOGIC PRESERVED]
+        # try:
+        #     intent = await asyncio.wait_for(self._llm_classify(text), timeout=10.0)
+        # except asyncio.TimeoutError:
+        #     intent = self._default_intent("timeout")
+        # except Exception as e:
+        #     intent = self._default_intent(str(e))
+        # self._cache_put(cache_key, intent)
+        # return intent
 
     async def _llm_classify(self, text: str) -> Intent:
         from groq import AsyncGroq
