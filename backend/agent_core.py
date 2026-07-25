@@ -2,10 +2,58 @@
 # Use: Core execution manager for custom plugins and agents.
 # agent_core.py — MAX v4.5 (Ghost Mode + Full Trackers - Uncompacted)
 
+import os
+import sys
+import base64
 import asyncio
 import logging
 import re
+import random
 from typing import Dict, Any, List, Optional
+
+try:
+    if hasattr(sys.stdout, 'reconfigure'):
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    if hasattr(sys.stderr, 'reconfigure'):
+        sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+except Exception:
+    pass
+
+PHONE_SWITCH_ACKS = [
+    "I'm on your phone now. Am I audible?",
+    "Shifted to your mobile! What's next?",
+    "Hey, active on your phone now. Let's continue from here.",
+    "Connected to your mobile. I'm right here!",
+    "Switched over to your phone. All set!",
+    "Got it, I'm on your phone now. What are we doing?",
+    "Mobile control active. Loud and clear?",
+    "Moved to your phone! Let's keep going.",
+    "Hey! Active on your mobile now. Tell me.",
+    "Phone link established. Ready when you are!",
+    "Switched to your phone. Can you hear me okay?",
+    "I'm right here on your phone now. Let's do this.",
+    "Mobile active! Continuing from where we left off.",
+    "Landed on your phone. What's the plan?",
+    "Control transferred to your mobile. Standing by!"
+]
+
+LAPTOP_SWITCH_ACKS = [
+    "Switched back to your laptop. Ready on desktop!",
+    "Back on your PC! Let me know what you need.",
+    "Laptop active now. Let me know what's next.",
+    "Connected to your laptop. Loud and clear?",
+    "Switched over to your PC. Ready to code!",
+    "Got it, active on your laptop now.",
+    "Back on the big screen! What's next?",
+    "Control transferred to laptop. Standing by!",
+    "Laptop link established. Ready when you are!",
+    "I'm back on your PC now. Can you hear me?",
+    "Switched to your laptop! Let's keep going.",
+    "Landed on your PC. Let's get to work.",
+    "Desktop active now! What are we tackling?",
+    "Back on your laptop! Let's do this.",
+    "Connected to laptop. All set!"
+]
 from config import config
 from modules.llm import get_response, get_response_with_skill_result, get_greeting, get_acknowledgment
 from modules.skills import get_skills_engine
@@ -27,9 +75,10 @@ _active_websockets = set()
 _main_event_loop = None
 active_device = "laptop"
 
-def register_websocket(websocket, loop):
+def register_websocket(websocket, loop, device: str = "laptop"):
     """Called by main.py on WebSocket connection to set globals."""
     global _active_websockets, _main_event_loop
+    websocket.device_name = device
     _active_websockets.add(websocket)
     _main_event_loop = loop
 
@@ -51,6 +100,20 @@ def set_active_device(device: str):
 def get_main_loop():
     return _main_event_loop
 
+def is_device_match(dev1: str, dev2: str) -> bool:
+    """Robust check to match equivalent device names (phone/mobile vs laptop/pc)."""
+    d1 = (dev1 or "").lower().strip()
+    d2 = (dev2 or "").lower().strip()
+    if d1 == d2:
+        return True
+    phones = {"phone", "mobile", "cellphone", "android", "ios"}
+    laptops = {"laptop", "pc", "desktop", "computer"}
+    if d1 in phones and d2 in phones:
+        return True
+    if d1 in laptops and d2 in laptops:
+        return True
+    return False
+
 
 def _force_open_app_skill(text: str) -> Optional[str]:
     """
@@ -58,9 +121,27 @@ def _force_open_app_skill(text: str) -> Optional[str]:
     Only runs when IntentEngine classifies as COMMAND.
     """
     text_lower = text.strip().lower()
+
+    # Guard: Never force open_app for questions about open apps/tabs/windows
+    question_triggers = ["how many", "what", "which", "tell me", "count", "list", "show", "is there", "are there", "open in", "open on", "open right now"]
+    if any(q in text_lower for q in question_triggers):
+        if any(w in text_lower for w in ["window", "windows", "tab", "tabs", "app", "apps", "browser", "desktop"]):
+            return "[SKILL:list_windows]"
+        return None
+
+    web_site_map = {
+        "google": "google.com", "google.com": "google.com",
+        "youtube": "youtube.com", "youtube.com": "youtube.com",
+        "chatgpt": "chatgpt.com", "gemini": "gemini.google.com",
+        "github": "github.com", "instagram": "instagram.com",
+        "facebook": "facebook.com", "twitter": "x.com", "x": "x.com",
+        "linkedin": "linkedin.com", "reddit": "reddit.com",
+        "gmail": "mail.google.com", "whatsapp web": "web.whatsapp.com"
+    }
+
     patterns = [
+        r"([a-zA-Z0-9 ._+\-'\"]{2,40})\s+(?:\bopen\s+kar(?:o|de)?|\bopen\b|\bkhol(?:o|na|do|de)?|\blaunch\s+kar(?:o|de)?)",
         r"(?:\bopen\b|\bkhol(?:o|na|do|de)?\b|\blaunch\b|\bstart\b)\s+([a-zA-Z0-9 ._+\-'\"]{2,40})",
-        r"([a-zA-Z0-9 ._+\-'\"]{2,40})\s+(?:\bopen\s+kar(?:o|de)?|\bkhol(?:o|na|do|de)?|\blaunch\s+kar(?:o|de)?)",
         r"(?:open|khol|launch)\s+(?:the\s+)?(?:app\s+)?([a-zA-Z0-9 ._+\-'\"]{2,40})",
     ]
     for pat in patterns:
@@ -68,10 +149,17 @@ def _force_open_app_skill(text: str) -> Optional[str]:
         if m:
             app_name = m.group(1).strip(" .,!?\"'").strip()
             if app_name and len(app_name) > 1:
-                non_apps = {"it", "this", "that", "them", "me", "us", "him", "her", "something", "anything", "everything", "nothing"}
-                if app_name.lower() in ["screen recording", "recording", "screen record", "screen capture"]:
+                # Strip trailing filler words (karo, kholo, do, de, na)
+                app_name = re.sub(r"\s+(?:kar(?:o|de)?|khol(?:o|na|do|de)?|do|de|na)$", "", app_name, flags=re.IGNORECASE).strip()
+                an_lower = app_name.lower()
+                if an_lower in web_site_map:
+                    return f"[SKILL:web_open:{web_site_map[an_lower]}]"
+                non_apps = {"it", "this", "that", "them", "me", "us", "him", "her", "something", "anything", "everything", "nothing", "in my browser", "in browser", "on desktop", "in desktop", "there", "karo", "kholo", "do", "de", "na", "open", "launch"}
+                if an_lower.startswith(("in ", "on ", "at ", "from ", "there", "here")):
+                    return None
+                if an_lower in ["screen recording", "recording", "screen record", "screen capture"]:
                     return "[SKILL:screen_record]"
-                if app_name.lower() not in non_apps:
+                if an_lower not in non_apps:
                     return f"[SKILL:open_app:{app_name}]"
     return None
 
@@ -121,11 +209,7 @@ class MaxAgent:
                     with open(tts_path, "rb") as f:
                         encoded_audio = base64.b64encode(f.read()).decode('utf-8')
                         
-                    for ws in list(_active_websockets):
-                        try:
-                            await ws.send_json({"event": "audio_response", "audio": encoded_audio})
-                        except Exception:
-                            pass
+                    await self._send_event_to_device(get_active_device(), {"event": "audio_response", "audio": encoded_audio})
                     try:
                         os.remove(tts_path)
                     except Exception:
@@ -145,37 +229,93 @@ class MaxAgent:
             except Exception:
                 pass
 
+    async def _send_event_to_device(self, target_device: str, payload: dict):
+        """Push event specifically to websockets matching target_device."""
+        global _active_websockets
+        if not _active_websockets:
+            return
+        for ws in list(_active_websockets):
+            dev = getattr(ws, "device_name", "")
+            if is_device_match(dev, target_device):
+                try:
+                    await ws.send_json(payload)
+                except Exception:
+                    pass
+
     async def process_text_input(self, text: str, use_tts: bool = True, input_source: str = "unknown") -> Dict[str, Any]:
-        print(f"\n🟢 [TRACKER: 1] Pipeline started! Input: '{text}' | Source: {input_source}")
+        print(f"\n[TRACKER: 1] Pipeline started! Input: '{text}' | Source: {input_source}")
         
         if not text or not text.strip():
-            print("🔴 [TRACKER: END] Text is empty.")
+            print("[TRACKER: END] Text is empty.")
             return {"response": "", "tts_path": "", "skill_used": None, "intent": "empty"}
         
         try:
             # 🚨 0. DEVICE SWITCHING INTERCEPT
             text_lower = text.lower().strip()
-            if any(phrase in text_lower for phrase in ["phone pe aa ja", "switch to phone", "connect to phone", "transfer to phone", "switch to mobile", "come in mobile", "mobile pe aa ja", "come to mobile"]):
-                print("📱 [TRACKER] Switching active device to PHONE")
+
+            phone_switch_patterns = [
+                r"\b(switch|shift|transfer|connect|move|come|aa\s*ja|chalo|aao)\b.*\b(phone|mobile|cellphone)\b",
+                r"\b(phone|mobile)\b.*\b(shift|switch|transfer|come|aa\s*ja|pe\s+aa)\b",
+                r"\b(come\s+in\s+to|come\s+to|shift\s+to|shift\s+on|move\s+to)\b.*\b(mobile|phone)\b"
+            ]
+            if any(re.search(pat, text_lower) for pat in phone_switch_patterns):
+                print("[TRACKER] Switching active device to PHONE")
                 set_active_device("phone")
                 await self._send_event_via_websocket({"event": "SWITCH_ACTIVE", "device": "phone"})
-                msg = "Control transferred to phone."
+                await self._send_event_to_device("phone", {"event": "start_continuous_listening"})
+                msg = random.choice(PHONE_SWITCH_ACKS)
                 tts_path = await generate_tts(msg) if use_tts else ""
-                return {"response": msg, "tts_path": tts_path, "skill_used": None, "intent": "device_switch"}
+                
+                # Directly push audio and text to phone device so the phone speaks out loud
+                if tts_path and os.path.exists(tts_path):
+                    try:
+                        with open(tts_path, "rb") as f:
+                            audio_b64 = base64.b64encode(f.read()).decode("utf-8")
+                        await self._send_event_to_device("phone", {"event": "response_text", "text": msg})
+                        await self._send_event_to_device("phone", {"event": "audio_response", "audio": audio_b64})
+                    except Exception as e:
+                        logger.error(f"Error sending audio to phone: {e}")
+                    finally:
+                        try:
+                            os.remove(tts_path)
+                        except Exception:
+                            pass
+
+                return {"response": msg, "tts_path": "", "skill_used": None, "intent": "device_switch"}
             
-            if any(phrase in text_lower for phrase in ["laptop pe wapas", "switch to laptop", "connect to laptop", "transfer to laptop", "pc pe wapas", "switch to pc", "come to pc", "laptop pe aa ja", "come in laptop", "pc pe aa ja", "come to laptop"]):
-                print("💻 [TRACKER] Switching active device to LAPTOP")
+            laptop_switch_patterns = [
+                r"\b(switch|shift|transfer|connect|move|come|aa\s*ja|wapas)\b.*\b(laptop|pc|computer|desktop)\b",
+                r"\b(laptop|pc|computer|desktop)\b.*\b(shift|switch|transfer|come|wapas|pe\s+wapas)\b"
+            ]
+            if any(re.search(pat, text_lower) for pat in laptop_switch_patterns):
+                print("[TRACKER] Switching active device to LAPTOP")
                 set_active_device("laptop")
                 await self._send_event_via_websocket({"event": "SWITCH_ACTIVE", "device": "laptop"})
-                msg = "Control transferred to laptop."
+                await self._send_event_to_device("laptop", {"event": "start_continuous_listening"})
+                msg = random.choice(LAPTOP_SWITCH_ACKS)
                 tts_path = await generate_tts(msg) if use_tts else ""
-                return {"response": msg, "tts_path": tts_path, "skill_used": None, "intent": "device_switch"}
+
+                if tts_path and os.path.exists(tts_path):
+                    try:
+                        with open(tts_path, "rb") as f:
+                            audio_b64 = base64.b64encode(f.read()).decode("utf-8")
+                        await self._send_event_to_device("laptop", {"event": "response_text", "text": msg})
+                        await self._send_event_to_device("laptop", {"event": "audio_response", "audio": audio_b64})
+                    except Exception as e:
+                        logger.error(f"Error sending audio to laptop: {e}")
+                    finally:
+                        try:
+                            os.remove(tts_path)
+                        except Exception:
+                            pass
+
+                return {"response": msg, "tts_path": "", "skill_used": None, "intent": "device_switch"}
 
             # 🚨 1. GHOST MODE INTERACTION BYPASS
-            print("🟢 [TRACKER: 2] Checking Ghost Mode...")
+            print("[TRACKER: 2] Checking Ghost Mode...")
             ghost_result = await self.process_ghost_mode_test(text)
             if ghost_result is not None:
-                print(f"🟢 [TRACKER: 3] Ghost Mode Triggered! Result: {ghost_result}")
+                print(f"[TRACKER: 3] Ghost Mode Triggered! Result: {ghost_result}")
                 if use_tts:
                     tts_path = await generate_tts(ghost_result["response"])
                     ghost_result["tts_path"] = tts_path
@@ -185,13 +325,13 @@ class MaxAgent:
                 return ghost_result
 
             # Step 1: Listening Manager (ONLY FOR VOICE)
-            print(f"🟢 [TRACKER: 4] Source is {input_source}. Checking ListeningManager...")
+            print(f"[TRACKER: 4] Source is {input_source}. Checking ListeningManager...")
             if input_source == "voice":
                 lm_result = self.listening_manager.process_transcript(text)
                 action = lm_result.get("action")
                 
                 if action == "ignore":
-                    print("🔴 [SILENT KILLER] ListeningManager dropped it (Missing wake word / background noise).")
+                    print("[SILENT KILLER] ListeningManager dropped it (Missing wake word / background noise).")
                     return {"response": "", "tts_path": "", "skill_used": None, "intent": "ignored"}
                     
                 if action == "reserved":
@@ -200,7 +340,7 @@ class MaxAgent:
                         self.listening_manager.continuous_mode = False
                     elif cmd in ["start listening", "sunna shuru karo"]:
                         self.listening_manager.continuous_mode = True
-                    print(f"🟢 [TRACKER] Reserved command triggered: {cmd}")
+                    print(f"[TRACKER] Reserved command triggered: {cmd}")
                     return {"response": f"Reserved command triggered: {cmd}", "tts_path": "", "skill_used": f"reserved:{cmd}", "intent": "reserved"}
                     
                 if action == "reply":
@@ -208,12 +348,12 @@ class MaxAgent:
                     tts_path = ""
                     if use_tts and resp_text:
                         tts_path = await generate_tts(resp_text)
-                    print(f"🟢 [TRACKER] Quick reply triggered: {resp_text}")
+                    print(f"[TRACKER] Quick reply triggered: {resp_text}")
                     return {"response": resp_text, "tts_path": tts_path, "skill_used": None, "intent": "reply"}
 
                 if action == "execute":
                     skill_tag = lm_result.get("skill_tag")
-                    print(f"🟢 [TRACKER] Fast Brain Execute -> {skill_tag}")
+                    print(f"[TRACKER] Fast Brain Execute -> {skill_tag}")
                     
                     try:
                         fast_ack = await asyncio.wait_for(get_acknowledgment(text), timeout=1.0)
@@ -232,13 +372,13 @@ class MaxAgent:
                     tts_path = ""
                     if use_tts and final_response:
                         tts_path = await generate_tts(self.gatekeeper.filter_for_tts(final_response))
-                        print(f"🟢 [TRACKER: FAST-9] Audio Generated! Path: {tts_path}")
+                        print(f"[TRACKER: FAST-9] Audio Generated! Path: {tts_path}")
                     return {"response": final_response, "tts_path": tts_path, "skill_used": skill_tag, "intent": "fast_brain"}
 
                 # Resolve text
                 text = lm_result.get("resolved_text", text)
 
-            print("🟢 [TRACKER: 5] Adding to memory & Fact Extraction...")
+            print("[TRACKER: 5] Adding to memory & Fact Extraction...")
             await self.memory.add_message("user", text)
             try:
                 await self.memory.extract_and_store_facts(text)
@@ -247,7 +387,7 @@ class MaxAgent:
 
             memory_context = self.memory.get_context()
 
-            print("🟢 [TRACKER: 6] Getting KB Context...")
+            print("[TRACKER: 6] Getting KB Context...")
             kb_prefix = ""
             try:
                 from modules.knowledge_base import get_knowledge_base
@@ -273,6 +413,7 @@ class MaxAgent:
                 tts_path = await generate_tts(cancel_text) if use_tts else ""
                 return {"response": cancel_text, "tts_path": tts_path, "skill_used": "orchestrator_cancel", "intent": "orchestrator_cancel"}
 
+            bypass_complexity = False
             pending = pop_pending_approval()
             if pending:
                 approval = approval_reply_kind(text)
@@ -282,10 +423,10 @@ class MaxAgent:
                         try:
                             audio = await generate_tts(self.gatekeeper.filter_for_tts(msg))
                             if audio:
-                                print(f"🔔 [ORCHESTRATOR NOTIFY] {msg}")
+                                print(f" [ORCHESTRATOR NOTIFY] {msg}")
                                 # Audio will be picked up by the frontend via the normal TTS path
                         except Exception as e:
-                            print(f"🔴 [ORCHESTRATOR NOTIFY ERROR] {e}")
+                            print(f" [ORCHESTRATOR NOTIFY ERROR] {e}")
 
                     task_id = start_orchestrator_background(
                         pending.get("query", text),
@@ -296,29 +437,32 @@ class MaxAgent:
                     tts_response = "Deep Orchestrator started. You can ask for status anytime."
                     tts_path = await generate_tts(self.gatekeeper.filter_for_tts(tts_response)) if use_tts else ""
                     return {"response": response, "tts_path": tts_path, "skill_used": "orchestrator", "intent": "orchestrator_started", "task_id": task_id}
-                if approval == "no":
+                elif approval == "no":
+                    # User explicitly chose Normal Mode — bypass complexity re-classification!
                     text = pending.get("query", text)
                     combined_context = pending.get("context", combined_context)
+                    bypass_complexity = True
                 else:
                     remember_pending_approval(pending.get("query", text), pending.get("context", combined_context))
-                    response = "Choose normal mode or deep Orchestrator mode for that task."
+                    response = "Choose normal mode or Deep mode for that task."
                     tts_path = await generate_tts(response) if use_tts else ""
                     return {"response": response, "tts_path": tts_path, "skill_used": None, "intent": "orchestrator_approval"}
 
-            complexity = await classify_complexity(text, combined_context)
-            if complexity == NEEDS_APPROVAL:
-                remember_pending_approval(text, combined_context)
-                response = "This looks like a deep task. Should MAX use normal mode or go deep with the Orchestrator? Deep mode is more thorough and takes longer."
-                tts_path = await generate_tts(self.gatekeeper.filter_for_tts(response)) if use_tts else ""
-                return {"response": response, "tts_path": tts_path, "skill_used": None, "intent": "orchestrator_approval"}
+            if not bypass_complexity:
+                complexity = await classify_complexity(text, combined_context)
+                if complexity == NEEDS_APPROVAL:
+                    remember_pending_approval(text, combined_context)
+                    response = "This looks like a deep task. Should i use normal mode or Deep mode?"
+                    tts_path = await generate_tts(self.gatekeeper.filter_for_tts(response)) if use_tts else ""
+                    return {"response": response, "tts_path": tts_path, "skill_used": None, "intent": "orchestrator_approval"}
 
-            print("🟢 [TRACKER: 7] Checking Intent...")
+            print(" [TRACKER: 7] Checking Intent...")
             intent = await self.intent_engine.classify(text)
             allow_skills = intent.should_execute_skill
 
             # 🤖 AGENT LOOP — multi-step goals get planned & executed autonomously
             if allow_skills and is_complex_goal(text):
-                print("🟢 [TRACKER: 7.5] Complex goal detected → Agent Loop engaged.")
+                print(" [TRACKER: 7.5] Complex goal detected  Agent Loop engaged.")
                 try:
                     try:
                         ack = await asyncio.wait_for(get_acknowledgment(text), timeout=1.0)
@@ -340,9 +484,9 @@ class MaxAgent:
                             tts_text = self.gatekeeper.filter_for_tts(final_response)
                             tts_path = await asyncio.wait_for(generate_tts(tts_text), timeout=15.0)
                         except Exception as e:
-                            print(f"🔴 [TRACKER: ERROR] TTS Crashed: {e}")
+                            print(f" [TRACKER: ERROR] TTS Crashed: {e}")
 
-                    print("🟢 [TRACKER: 7.9] Agent Loop complete. Returning to main.")
+                    print(" [TRACKER: 7.9] Agent Loop complete. Returning to main.")
                     return {
                         "response": final_response,
                         "tts_path": tts_path,
@@ -351,9 +495,9 @@ class MaxAgent:
                     }
                 except Exception as e:
                     logger.error(f"Agent loop failed — falling back to single-shot: {e}", exc_info=True)
-                    print(f"🔴 [TRACKER: 7.5 ERROR] Agent Loop failed ({e}). Using normal path.")
+                    print(f" [TRACKER: 7.5 ERROR] Agent Loop failed ({e}). Using normal path.")
 
-            print("🟢 [TRACKER: 8] Acknowledgment & LLM Call...")
+            print(" [TRACKER: 8] Acknowledgment & LLM Call...")
             ack_task = None
             if allow_skills:  
                 try:
@@ -366,14 +510,14 @@ class MaxAgent:
             result = await get_response(text, combined_context, allow_skills=allow_skills)
             llm_response = result["response"]
             skill_tag = result.get("skill") if allow_skills else None
-            print(f"🟢 [TRACKER: 9] LLM Replied. Skill: {skill_tag}")
+            print(f" [TRACKER: 9] LLM Replied. Skill: {skill_tag}")
 
             if allow_skills and not skill_tag:
                 skill_tag = _force_open_app_skill(text)
 
             final_response = llm_response
             if skill_tag:
-                print(f"🟢 [TRACKER: 10] Executing Skill: {skill_tag}")
+                print(f" [TRACKER: 10] Executing Skill: {skill_tag}")
                 skill_result = await self.skills.parse_and_execute(skill_tag, combined_context, text)
                 if skill_result.get("executed"):
                     skill_output = skill_result.get("result", "").strip()
@@ -399,7 +543,7 @@ class MaxAgent:
                 await self.memory.update_personality(len(final_response), "")
 
             filtered = self.gatekeeper.filter(final_response)
-            print("🟢 [TRACKER: 11] Filtering done. Text ready for TTS.")
+            print(" [TRACKER: 11] Filtering done. Text ready for TTS.")
 
             try:
                 from modules.skill_forge import get_skill_forge
@@ -412,13 +556,13 @@ class MaxAgent:
 
             tts_path = ""
             if use_tts and filtered:
-                print("🟢 [TRACKER: 12] Generating Audio from Kokoro...")
+                print(" [TRACKER: 12] Generating Audio from Kokoro...")
                 try:
                     tts_text = self.gatekeeper.filter_for_tts(filtered)
                     tts_path = await asyncio.wait_for(generate_tts(tts_text), timeout=15.0)
-                    print(f"🟢 [TRACKER: 13] Audio Generated! Path: {tts_path}")
+                    print(f" [TRACKER: 13] Audio Generated! Path: {tts_path}")
                 except Exception as e:
-                    print(f"🔴 [TRACKER: ERROR] TTS Crashed: {e}")
+                    print(f" [TRACKER: ERROR] TTS Crashed: {e}")
 
             if ack_task and not ack_task.done():
                 try:
@@ -426,7 +570,7 @@ class MaxAgent:
                 except Exception:
                     pass
 
-            print("🟢 [TRACKER: 14] Pipeline Complete. Returning to main.")
+            print(" [TRACKER: 14] Pipeline Complete. Returning to main.")
             return {
                 "response": filtered,
                 "tts_path": tts_path,
@@ -435,7 +579,7 @@ class MaxAgent:
             }
 
         except Exception as e:
-            print(f"🔴 [FATAL ERROR] process_text_input crashed: {e}")
+            print(f" [FATAL ERROR] process_text_input crashed: {e}")
             logger.error(f"process_text_input error: {e}", exc_info=True)
             return {
                 "response": "Something went wrong. Try again?",
