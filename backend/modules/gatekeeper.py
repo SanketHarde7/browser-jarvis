@@ -211,9 +211,17 @@ class ResponseGatekeeper:
         
         return result
 
-    def filter_for_tts(self, text: str, max_chars: int = 3000) -> str:
-        """Aggressive filter for TTS — strips emojis, markdown, trims to sentence boundary."""
-        result = self.filter(text)
+    def filter_for_tts(self, text: str, max_chars: int = 350) -> str:
+        """Aggressive filter for TTS — strips emojis, code blocks, markdown, trims to clean sentence boundary."""
+        if not text:
+            return ""
+
+        # Strip code blocks and markdown fences for spoken audio
+        result = re.sub(r"```[\s\S]*?```", "", text)
+        result = re.sub(r"`[^`]*`", "", result)
+        result = re.sub(r"#+\s*", "", result)
+        
+        result = self.filter(result)
         result = _strip_urls_for_tts(result)
         
         for rule in self._tts_rules:
@@ -221,18 +229,17 @@ class ResponseGatekeeper:
         
         result = re.sub(r" {2,}", " ", result).strip()
 
-        # Smart truncation at sentence boundary
+        # Smart truncation at sentence boundary for fast Kokoro audio synthesis
         if len(result) > max_chars:
             trunc = result[:max_chars]
             # Find last sentence boundary
             for delim in ['. ', '! ', '? ', '; ']:
                 last = trunc.rfind(delim)
-                if last > max_chars // 3:
+                if last > 80:
                     result = trunc[:last + 1].strip()
                     break
             else:
-                # No good boundary found, just truncate
-                result = trunc.rstrip(" ,;")
+                result = trunc.rstrip(" ,;") + "."
 
         return result.strip()
 
