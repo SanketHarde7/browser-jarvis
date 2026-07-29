@@ -84,8 +84,8 @@ class Config:
     PROJECT_ROOT: Path = PROJECT_ROOT
     BACKEND_DIR: Path = PROJECT_ROOT / "backend"
     DATA_DIR: Path = BACKEND_DIR / "data"
-    WORKSPACE_DIR: Path = Path(os.getenv("WORKSPACE_DIR", str(Path.home() / "projects")))
-    CODE_SAVE_DIR: Path = Path(os.getenv("CODE_SAVE_DIR", str(Path.home() / "projects" / "jarvis-generated")))
+    WORKSPACE_DIR: Path = Path(os.getenv("WORKSPACE_DIR", str(PROJECT_ROOT)))
+    CODE_SAVE_DIR: Path = Path(os.getenv("CODE_SAVE_DIR", str(PROJECT_ROOT / "Jarvis Generated")))
     PLUGINS_DIR: Path = Path(os.getenv("PLUGINS_DIR", str(BACKEND_DIR / "plugins")))
 
     # ── Search Dirs — used by file_manager ──
@@ -131,7 +131,8 @@ class Config:
     # ── AI Models ──
     LLM_MODEL: str = os.getenv("LLM_MODEL", "llama-3.3-70b-versatile")
     WHISPER_MODEL: str = os.getenv("WHISPER_MODEL", "whisper-large-v3")
-    VISION_MODEL: str = os.getenv("VISION_MODEL", "Qwen/Qwen3.6-27B")
+    GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
+    VISION_MODEL: str = os.getenv("VISION_MODEL", "gemini-1.5-flash")
 
     # ── Groq Rate-Limit Manager ──
     # Free tier ≈ 30 requests/min per key → keep a small safety margin.
