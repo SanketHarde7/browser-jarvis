@@ -17,6 +17,19 @@ try:
 except Exception:
     pass
 
+# Safe excepthook to silence WatchFiles / KeyboardInterrupt reload teardown errors
+_orig_excepthook = sys.excepthook
+def _safe_excepthook(type_, value_, traceback_):
+    if type_ is KeyboardInterrupt or "WatchFiles" in str(type_):
+        return
+    if _orig_excepthook:
+        try:
+            _orig_excepthook(type_, value_, traceback_)
+        except Exception:
+            pass
+
+sys.excepthook = _safe_excepthook
+
 import base64
 import re
 import uuid
@@ -63,6 +76,17 @@ active_websocket: Optional[WebSocket] = None
 main_loop: Optional[asyncio.AbstractEventLoop] = None
 health_buddy_instance: Optional[HealthBuddy] = None
 
+# ═══════════════════════════════════════════════════
+# LOGGING
+# ═══════════════════════════════════════════════════
+
+logging.basicConfig(
+    level=logging.INFO if not config.DEBUG else logging.DEBUG,
+    format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
+    datefmt="%H:%M:%S",
+)
+logger = logging.getLogger("MAX.API")
+
 def send_health_buddy_alert(payload):
     from agent_core import get_active_websockets, get_main_loop
     ws_list = get_active_websockets()
@@ -75,17 +99,6 @@ def send_health_buddy_alert(payload):
                 except Exception as e:
                     logger.warning(f"Failed to stream health alert: {e}")
         asyncio.run_coroutine_threadsafe(_send(), loop)
-
-# ═══════════════════════════════════════════════════
-# LOGGING
-# ═══════════════════════════════════════════════════
-
-logging.basicConfig(
-    level=logging.INFO if not config.DEBUG else logging.DEBUG,
-    format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
-    datefmt="%H:%M:%S",
-)
-logger = logging.getLogger("MAX.API")
 
 # ═══════════════════════════════════════════════════
 # FASTAPI APP
@@ -537,10 +550,6 @@ async def process_voice_request(
 
         result = await agent.process_text_input(transcript, use_tts=True, input_source="voice")
         
-        if connection_state["current_request_id"] != rid:
-            logger.info(f"Voice task {rid} discarded before sending response.")
-            return
-
         # ── Check for device switch intent ──
         if result.get("intent") == "device_switch":
             logger.info("Device switch executed. Target device notified directly.")
@@ -571,12 +580,11 @@ async def process_voice_request(
                     audio_bytes = f.read()
                     encoded_audio = base64.b64encode(audio_bytes).decode('utf-8')
                     logger.info(f"Voice TTS encoded audio length: {len(encoded_audio)} chars")
-                    if connection_state["current_request_id"] == rid:
-                        await websocket.send_json({
-                            "event": "audio_response",
-                            "audio": encoded_audio,
-                            "command_id": rid
-                        })
+                    await websocket.send_json({
+                        "event": "audio_response",
+                        "audio": encoded_audio,
+                        "command_id": rid
+                    })
                 # Clean up temp TTS file
                 try:
                     os.remove(tts_path)
@@ -1394,7 +1402,7 @@ if __name__ == "__main__":
             host=config.HOST,
             port=config.PORT,
             reload=True,
-            reload_excludes=["*.json", "data/*", "knowledge/*"],
+            reload_excludes=["*.json", "*.png", "*.jpg", "*.wav", "*.mp3", "*.log", "data/*", "knowledge/*", "brain/*", "scratch/*", ".system_generated/*"],
             log_level="debug",
         )
     else:
