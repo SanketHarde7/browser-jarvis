@@ -152,6 +152,12 @@ def _force_open_app_skill(text: str) -> Optional[str]:
                 # Strip trailing filler words (karo, kholo, do, de, na)
                 app_name = re.sub(r"\s+(?:kar(?:o|de)?|khol(?:o|na|do|de)?|do|de|na)$", "", app_name, flags=re.IGNORECASE).strip()
                 an_lower = app_name.lower()
+
+                # Guard: Do not force open_app for multi-action compound sentences
+                complex_indicators = [" and ", " aur ", " then ", " to ", " take ", " send ", " tell ", " check ", " what ", " screenshot ", " whatsapp "]
+                if any(ind in an_lower for ind in complex_indicators) or len(an_lower.split()) > 4:
+                    return None
+
                 if an_lower in web_site_map:
                     return f"[SKILL:web_open:{web_site_map[an_lower]}]"
                 non_apps = {"it", "this", "that", "them", "me", "us", "him", "her", "something", "anything", "everything", "nothing", "in my browser", "in browser", "on desktop", "in desktop", "there", "karo", "kholo", "do", "de", "na", "open", "launch"}
@@ -250,8 +256,47 @@ class MaxAgent:
             return {"response": "", "tts_path": "", "skill_used": None, "intent": "empty"}
         
         try:
-            # 🚨 0. DEVICE SWITCHING INTERCEPT
+            # 🚨 0. EMERGENCY KILL-SWITCH & GUEST PERMISSION GATE
             text_lower = text.lower().strip()
+
+            # 🚨 0. SECRET ADMIN ELEVATION PASSPHRASE INTERCEPT
+            admin_secret = os.getenv("MAX_ADMIN_ELEVATION_PASSPHRASE", "").strip()
+            if admin_secret and len(admin_secret) >= 8:
+                import hmac
+                # Check for exact token match or exact secret phrase match in prompt
+                words = text_lower.split()
+                if any(hmac.compare_digest(w, admin_secret.lower()) for w in words) or hmac.compare_digest(text_lower, admin_secret.lower()):
+                    from modules.device_security import get_security_manager
+                    sec = get_security_manager(self.config)
+                    active_dev = get_active_device()
+                    success, msg = sec.elevate_device_to_master(active_dev)
+                    tts_path = await generate_tts(msg) if use_tts else ""
+                    return {"response": msg, "tts_path": tts_path, "skill_used": "admin_elevation", "intent": "admin_elevation"}
+
+            if any(p in text_lower for p in ["emergency shutdown", "kill max backend", "shutdown max backend", "kill backend", "emergency killswitch"]):
+                from modules.device_security import get_security_manager
+                sec = get_security_manager(self.config)
+                active_dev = get_active_device()
+                success, msg = sec.execute_emergency_killswitch(active_dev)
+                tts_path = await generate_tts(msg) if use_tts and success else ""
+                return {"response": msg, "tts_path": tts_path, "skill_used": "emergency_killswitch", "intent": "emergency_killswitch"}
+
+            from modules.device_security import get_security_manager
+            sec = get_security_manager(self.config)
+            active_dev = get_active_device()
+            is_approved, role = sec.validate_device(active_dev)
+
+            if role == "GUEST":
+                restricted_keywords = [
+                    r"\bshutdown\b", r"\bquit\s+max\b", r"\bdelete\s+file\b", r"\brun\s+code\b", r"\bwrite\s+code\b", 
+                    r"\bapprove\s+device\b", r"\brevoke\s+device\b", r"\bsystem_shutdown\b",
+                    r"\bclose\s+app\b", r"\bclose_app\b", r"\bclose\s+window\b", r"\bclose_window\b", 
+                    r"\balt\+f4\b", r"\balt\s+f4\b", r"\bkey_chord\b", r"\bkill\b", r"\bformat\b"
+                ]
+                if any(re.search(pat, text_lower) for pat in restricted_keywords):
+                    msg = "Permission Denied: System control and app closing actions can only be executed by the Master Device (Sanket's Phone)."
+                    tts_path = await generate_tts(msg) if use_tts else ""
+                    return {"response": msg, "tts_path": tts_path, "skill_used": None, "intent": "permission_denied"}
 
             phone_switch_patterns = [
                 r"\b(switch|shift|transfer|connect|move|come|aa\s*ja|chalo|aao)\b.*\b(phone|mobile|cellphone)\b",
@@ -528,7 +573,9 @@ class MaxAgent:
                         lower_output = skill_output.lower()
                         skill_failed = any(ind in lower_output for ind in fail_indicators)
                     
-                    if skill_result.get("is_data_skill"):
+                    if skill_result.get("skill_name") == "read_screen":
+                        final_response = skill_output or "I checked your screen."
+                    elif skill_result.get("is_data_skill"):
                         summary = await get_response_with_skill_result(text, skill_output, combined_context)
                         final_response = summary["response"]
                         await self.memory.update_personality(len(final_response), skill_result.get("skill_name", ""))
