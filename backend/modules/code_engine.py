@@ -5,7 +5,7 @@ code_engine.py — MAX v4.0
 Handles: write_code, run_code, code_review, fix_code, project_scaffold
 Tone: Friendly, no 'sir' overload.
 """
-
+import asyncio
 import os
 import re
 import sys
