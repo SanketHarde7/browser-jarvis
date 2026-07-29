@@ -141,11 +141,13 @@ class LocalFastBrain:
         if lower in tier1_map:
             return 1, tier1_map[lower]
 
-        # Tier 2: Open app
+        # Tier 2: Open app (Only for simple single-target app/folder requests, NOT compound/multi-action sentences)
         for prefix in ["open ", "kholo "]:
             if lower.startswith(prefix):
                 app = lower[len(prefix):].strip()
-                if app:
+                # If command contains conjunctions, multi-action verbs or is long, pass to LLM (Tier 3)
+                complex_indicators = [" and ", " aur ", " then ", " to ", " take ", " send ", " tell ", " check ", " what ", " screenshot ", " whatsapp "]
+                if app and len(app.split()) <= 4 and not any(ind in app for ind in complex_indicators):
                     return 2, f"[SKILL:open_app:{app}]"
 
         # Tier 2: YouTube search
