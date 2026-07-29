@@ -199,6 +199,35 @@ export default function StatusBar({
           {time}
         </span>
 
+        {/* Master Emergency Kill-Switch Button */}
+        {connected && (
+          <button
+            onClick={() => {
+              if (window.confirm("⚠️ ARE YOU SURE YOU WANT TO TRIGGER EMERGENCY SHUTDOWN ON MAX BACKEND PC?")) {
+                if (window.wsInstance && window.wsInstance.readyState === WebSocket.OPEN) {
+                  window.wsInstance.send(JSON.stringify({ type: "text", text: "Emergency Shutdown MAX Backend", source: "master_mobile" }));
+                }
+              }
+            }}
+            style={{
+              background: 'rgba(255, 58, 58, 0.15)',
+              border: '1px solid rgba(255, 58, 58, 0.4)',
+              borderRadius: '10px',
+              padding: '0.45rem 0.7rem',
+              color: '#ff3a3a',
+              cursor: 'pointer',
+              fontSize: '0.75rem',
+              fontWeight: 700,
+              display: 'flex',
+              alignItems: 'center',
+              gap: '0.3rem'
+            }}
+            title="Emergency Shutdown MAX Backend PC"
+          >
+            🛑 SHUTDOWN
+          </button>
+        )}
+
         {/* Chat toggle */}
         <button
           onClick={onToggleChat}
