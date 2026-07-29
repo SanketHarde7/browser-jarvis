@@ -24,9 +24,10 @@ class MemoryManager:
     - Personality evolution profile
     """
     
-    def __init__(self, memory_file: str, max_messages: int = 20, summarize_threshold: int = 20):
+    def __init__(self, memory_file: str, max_messages: int = 5, summarize_threshold: int = 50):
         self.memory_file = Path(memory_file)
         self.max_messages = max_messages
+        self.max_history_retention = 50
         self.summarize_threshold = summarize_threshold
         self._lock = asyncio.Lock()
         
@@ -80,7 +81,16 @@ class MemoryManager:
             temp_file = self.memory_file.with_suffix('.tmp')
             with open(temp_file, 'w', encoding='utf-8') as f:
                 json.dump(self.memory, f, indent=2, ensure_ascii=False)
-            temp_file.replace(self.memory_file)
+            try:
+                temp_file.replace(self.memory_file)
+            except OSError:
+                with open(self.memory_file, 'w', encoding='utf-8') as f:
+                    json.dump(self.memory, f, indent=2, ensure_ascii=False)
+                if temp_file.exists():
+                    try:
+                        temp_file.unlink()
+                    except Exception:
+                        pass
             return True
         except Exception as e:
             logger.error(f"❌ Failed to save memory to disk: {e}")
@@ -109,9 +119,9 @@ class MemoryManager:
                 if len(self.memory["messages"]) >= self.summarize_threshold:
                     self._auto_summarize_internal()
                 
-                # Keep only last max_messages
-                if len(self.memory["messages"]) > self.max_messages:
-                    self.memory["messages"] = self.memory["messages"][-self.max_messages:]
+                # Keep extended history retention (up to 50 messages) for on-demand skill recall
+                if len(self.memory["messages"]) > self.max_history_retention:
+                    self.memory["messages"] = self.memory["messages"][-self.max_history_retention:]
                 
                 return self._save_to_disk()
                 
@@ -217,8 +227,26 @@ class MemoryManager:
                 return self._save_to_disk()
         except Exception as e:
             logger.error(f"❌ Failed to update user fact: {e}")
-            return False
-    
+
+    def get_recent_history(self, limit: int = 20) -> str:
+        """
+        On-demand recall of past conversation history.
+        Returns formatted transcript of the last `limit` messages.
+        """
+        messages = self.memory.get("messages", [])
+        if not messages:
+            return "No previous conversation history found."
+        
+        recent = messages[-limit:]
+        lines = [f"=== RECENT CONVERSATION HISTORY (Last {len(recent)} messages) ==="]
+        for idx, m in enumerate(recent, 1):
+            role = "Sanket" if m["role"] == "user" else "MAX"
+            timestamp = m.get("timestamp", "")
+            time_str = f" [{timestamp[11:16]}]" if len(timestamp) >= 16 else ""
+            lines.append(f"{idx}. {role}{time_str}: {m['content']}")
+        
+        return "\n".join(lines)
+
     async def extract_and_store_facts(self, user_text: str) -> List[str]:
         """
         Simple pattern-based fact extraction.
