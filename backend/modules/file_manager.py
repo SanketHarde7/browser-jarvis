@@ -1,372 +1,317 @@
 # Path: backend/modules/file_manager.py
-# Use: Handles local file reading, writing, and navigation.
-"""
-file_manager.py — MAX v4.0
-Enhanced file management with search, list, read, edit.
-Friendly tone, no 'sir' overload.
-"""
+# Use: Smart PC File Search, Fuzzy Path Resolution, and File Operations Engine for MAX Assistant.
 
 import os
-import re
-import json
+import sys
+import shutil
 import logging
 from pathlib import Path
-from typing import Optional, List, Dict, Any, Tuple
-from datetime import datetime
+from typing import Dict, Any, List, Optional, Tuple
 
 logger = logging.getLogger("MAX.FILE_MANAGER")
 
+class SmartFileManager:
+    """
+    Smart PC File Management Engine for MAX Assistant.
+    Indexes user folders (OneDrive Desktop, Downloads, Documents, Pictures),
+    performs fuzzy file searching, file copying/moving, and step verification.
+    """
+    _instance = None
 
-class FileManager:
-    """Advanced file management for MAX."""
-
-    def __init__(self, config):
-        self.config = config
-        self.search_dirs = config.SEARCH_DIRS if hasattr(config, 'SEARCH_DIRS') else [Path.home() / "Desktop"]
-        self.max_file_size_kb = config.MAX_FILE_SIZE_KB if hasattr(config, 'MAX_FILE_SIZE_KB') else 5000
-        self.file_icons = getattr(config, 'FILE_ICONS', {"folder": "📁", "default": "📄"})
-
-    # ═══════════════════════════════════════════
-    # SKILL: find_and_explain
-    # ═══════════════════════════════════════════
-
-    def find_and_explain(self, *args) -> str:
-        try:
-            if len(args) >= 2:
-                filename = args[0]
-                context = args[1]
-            elif len(args) == 1:
-                filename = args[0]
-                context = ""
-            else:
-                return "File ka naam aur context do boss."
-
-            logger.info(f"Searching for: {filename} in context: {context}")
-
-            results = self._search_for_file(filename)
-            if not results:
-                return f"'{filename}' kahi nahi mila boss."
-
-            best_match = results[0]
-            content = self._read_file_safe(best_match)
-            icon = self._get_file_icon(best_match)
-
-            explanation = self._explain_content(content, best_match, context)
-
-            rel_path = self._make_relative(best_match)
-            response = (
-                f"📁 File: {rel_path} {icon}\n"
-                f"📊 Size: {best_match.stat().st_size:,} bytes | Modified: {datetime.fromtimestamp(best_match.stat().st_mtime).strftime('%Y-%m-%d %H:%M')}\n"
-                f"\n📖 Explanation:\n{explanation}\n\n"
-                f"💡 Quick Actions: is file ka code review kar sakta hoon, run kar sakta hoon, ya koi bug fix kar sakta hoon."
-            )
-
-            if len(results) > 1:
-                others = ", ".join(self._make_relative(r) for r in results[1:3])
-                response += f"\n\n📂 Aur bhi mil gayi: {others}"
-
-            return response
-
-        except Exception as e:
-            logger.error(f"find_and_explain error: {e}")
-            return f"File dhundne mein error aaya boss: {str(e)}"
-
-    def _search_for_file(self, filename: str) -> List[Path]:
-        matches = []
-        search_name = filename.lower()
-
-        for search_dir in self.search_dirs:
-            if not search_dir.exists():
-                continue
-            try:
-                for item in search_dir.rglob("*"):
-                    if item.is_file() and search_name in item.name.lower():
-                        matches.append(item)
-                        if len(matches) >= 5:
-                            break
-            except PermissionError:
-                continue
-
-        matches.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-        return matches[:5]
-
-    def _read_file_safe(self, filepath: Path) -> str:
-        try:
-            size = filepath.stat().st_size
-            max_size = self.max_file_size_kb * 1024
-            if size > max_size:
-                with open(filepath, 'r', encoding='utf-8', errors='replace') as f:
-                    return f.read(max_size) + "\n\n... (file truncated, bahut bada hai boss)"
-            return filepath.read_text(encoding='utf-8', errors='replace')
-        except Exception as e:
-            return f"Error reading file: {str(e)}"
-
-    def _explain_content(self, content: str, filepath: Path, context: str = "") -> str:
-        lines = content.split('\n')
-        total_lines = len(lines)
-
-        ext = filepath.suffix.lower()
-
-        explanation_parts = []
-
-        if ext == '.py':
-            imports = [l.strip() for l in lines if l.strip().startswith(('import ', 'from '))]
-            functions = [l.strip() for l in lines if l.strip().startswith('def ')]
-            classes = [l.strip() for l in lines if l.strip().startswith('class ')]
-
-            explanation_parts.append(f"Python script hai boss. {total_lines} lines.")
-            if imports:
-                explanation_parts.append(f"Libraries: {', '.join(imports[:3])}")
-            if classes:
-                explanation_parts.append(f"Classes: {len(classes)}")
-            if functions:
-                explanation_parts.append(f"Functions: {len(functions)}")
-
-        elif ext in ('.js', '.ts', '.jsx', '.tsx'):
-            imports = [l.strip() for l in lines if 'import' in l or 'require(' in l]
-            functions = [l.strip() for l in lines if 'function ' in l or 'const ' in l and '=>' in l]
-            explanation_parts.append(f"JavaScript/TypeScript file hai. {total_lines} lines.")
-            if imports:
-                explanation_parts.append(f"Dependencies: {len(imports)} imports")
-            if functions:
-                explanation_parts.append(f"Functions: {len(functions)}")
-
-        elif ext in ('.html', '.htm'):
-            tags = self._extract_html_tags(content)
-            explanation_parts.append(f"HTML file hai. {total_lines} lines.")
-            if tags:
-                explanation_parts.append(f"Main tags: {', '.join(tags[:5])}")
-
-        elif ext == '.json':
-            try:
-                data = json.loads(content)
-                explanation_parts.append(f"JSON file hai. Top-level keys: {list(data.keys())[:5]}")
-            except Exception:
-                explanation_parts.append(f"JSON file hai but invalid format boss.")
-
-        elif ext in ('.md', '.txt'):
-            words = len(content.split())
-            explanation_parts.append(f"Text file hai. {words} words, {total_lines} lines.")
-            first_line = lines[0].strip() if lines else ""
-            if first_line:
-                explanation_parts.append(f"Starts with: '{first_line[:50]}'")
-
-        elif ext in ('.yml', '.yaml'):
-            explanation_parts.append(f"YAML config file hai. {total_lines} lines.")
-
-        elif ext in ('.css', '.scss'):
-            selectors = len([l for l in lines if '{' in l])
-            explanation_parts.append(f"Stylesheet hai. {selectors} selectors, {total_lines} lines.")
-
-        else:
-            explanation_parts.append(f"File hai boss. {total_lines} lines, {len(content)} characters.")
-            first_line = lines[0].strip() if lines else ""
-            if first_line:
-                explanation_parts.append(f"First line: '{first_line[:50]}'")
-
-        if context:
-            explanation_parts.append(f"\nContext '{context}' ke hisaab se relevant sections:")
-            relevant = self._find_relevant_sections(content, context)
-            for section in relevant[:2]:
-                explanation_parts.append(f"  - {section}")
-
-        return "\n".join(explanation_parts)
-
-    def _extract_html_tags(self, content: str) -> List[str]:
-        tags = set()
-        for match in re.finditer(r'<(\w+)', content):
-            tag = match.group(1).lower()
-            if tag not in ('div', 'span', 'p', 'a'):
-                tags.add(tag)
-        return list(tags)
-
-    def _find_relevant_sections(self, content: str, context: str) -> List[str]:
-        lines = content.split('\n')
-        relevant = []
-        context_lower = context.lower()
-        for i, line in enumerate(lines):
-            if context_lower in line.lower():
-                start = max(0, i - 1)
-                end = min(len(lines), i + 2)
-                section = ' '.join(lines[start:end]).strip()
-                if len(section) > 20:
-                    relevant.append(section[:100] + "..." if len(section) > 100 else section)
-        return relevant
-
-    def _make_relative(self, filepath: Path) -> str:
-        try:
-            for search_dir in self.search_dirs:
-                if search_dir in filepath.parents or filepath.is_relative_to(search_dir):
-                    return str(filepath.relative_to(search_dir))
-            return str(filepath)
-        except Exception:
-            return str(filepath)
-
-    def _get_file_icon(self, filepath: Path) -> str:
-        return self.file_icons.get(filepath.suffix.lower(), self.file_icons.get("default", "📄"))
-
-    # ═══════════════════════════════════════════
-    # SKILL: list_files
-    # ═══════════════════════════════════════════
-
-    def list_files(self, *args) -> str:
-        try:
-            folder = args[0] if args else "."
-            path = Path(folder).expanduser().resolve()
-            if not path.is_absolute():
-                path = self.search_dirs[0] / folder
+    def __init__(self):
+        self.user_profile = Path(os.environ.get("USERPROFILE", r"C:\Users\sanke"))
+        
+        # Exact User Path Definitions
+        self.folder_map = {
+            "desktop": self.user_profile / "OneDrive" / "Desktop",
+            "documents": self.user_profile / "OneDrive" / "Documents",
+            "pictures": self.user_profile / "OneDrive" / "Pictures",
+            "downloads": self.user_profile / "Downloads",
+            "workspace": self.user_profile / "OneDrive" / "Desktop" / "Jarvis"
+        }
+        
+        # Verify and create fallback paths if needed
+        for name, path in self.folder_map.items():
             if not path.exists():
-                return f"Folder nahi mila boss: {folder}"
-            if not path.is_dir():
-                return f"Yeh folder nahi hai boss: {folder}"
+                logger.warning(f"Folder path '{path}' does not exist. Using fallback.")
 
-            items = sorted(path.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower()))
+    @classmethod
+    def get_instance(cls):
+        if cls._instance is None:
+            cls._instance = SmartFileManager()
+        return cls._instance
+
+    def resolve_folder_alias(self, alias: str) -> Path:
+        """Map alias like 'downloads', 'desktop', 'documents' to exact Path with Path Traversal Sandboxing."""
+        alias_clean = str(alias).lower().strip()
+        if alias_clean in self.folder_map:
+            return self.folder_map[alias_clean]
+        
+        # Direct path check with Sandbox Guard (Must be inside user profile)
+        try:
+            p = Path(alias).resolve()
+            user_profile_resolved = self.user_profile.resolve()
+            if p.exists() and p.is_dir() and (user_profile_resolved in p.parents or p == user_profile_resolved):
+                return p
+        except Exception:
+            pass
+            
+        return self.folder_map["downloads"]
+
+    def find_file(self, query: str, folder_hint: str = None) -> Tuple[bool, str, Optional[Path]]:
+        """
+        Smart Natural Language & Fuzzy File Search.
+        Resolves queries like:
+        - "Downloads me photo jo aaj download kiya"
+        - "Latest PDF file on Desktop"
+        - "Recent document"
+        """
+        if not query or not query.strip():
+            return self.get_latest_file(folder_alias=folder_hint or "downloads")
+
+        query_clean = query.lower().strip()
+
+        # Check for natural language cues (aaj, today, photo, image, latest, recent)
+        nl_cues = ["photo", "image", "picture", "screenshot", "pdf", "doc", "latest", "recent", "aaj", "today", "abhi"]
+        if any(cue in query_clean for cue in nl_cues):
+            res_ok, res_msg, res_path = self.smart_resolve_file(query_clean, folder_hint)
+            if res_ok and res_path:
+                return res_ok, res_msg, res_path
+
+        search_dirs = []
+
+        if folder_hint:
+            target_dir = self.resolve_folder_alias(folder_hint)
+            if target_dir.exists():
+                search_dirs.append(target_dir)
+
+        # Fallback to searching all key user directories
+        if not search_dirs:
+            search_dirs = [
+                self.folder_map["downloads"],
+                self.folder_map["desktop"],
+                self.folder_map["documents"],
+                self.folder_map["workspace"]
+            ]
+
+        matches: List[Tuple[float, Path]] = []
+
+        for s_dir in search_dirs:
+            if not s_dir.exists():
+                continue
+            try:
+                for root, _, files in os.walk(s_dir):
+                    for f in files:
+                        f_lower = f.lower()
+                        # Direct or fuzzy substring match
+                        if query_clean in f_lower:
+                            full_p = Path(root) / f
+                            score = len(query_clean) / max(len(f_lower), 1)
+                            matches.append((score, full_p))
+            except Exception as e:
+                logger.error(f"Error scanning dir '{s_dir}': {e}")
+
+        if matches:
+            # Sort by highest match score and newest modification time
+            matches.sort(key=lambda x: (x[0], x[1].stat().st_mtime if x[1].exists() else 0), reverse=True)
+            best_match = matches[0][1]
+            logger.info(f"✅ Found file for '{query}': {best_match}")
+            return True, f"File found: {best_match.name}", best_match
+
+        return False, f"No file matching '{query}' found in indexed directories.", None
+
+    def get_latest_file(self, folder_alias: str = "downloads") -> Tuple[bool, str, Optional[Path]]:
+        """Retrieve the most recently created/modified file in a folder."""
+        target_dir = self.resolve_folder_alias(folder_alias)
+        if not target_dir.exists():
+            return False, f"Folder '{target_dir}' does not exist.", None
+
+        try:
+            files = [target_dir / f for f in os.listdir(target_dir) if (target_dir / f).is_file()]
+            if not files:
+                return False, f"No files found in '{target_dir.name}'.", None
+
+            latest_file = max(files, key=lambda p: p.stat().st_mtime)
+            return True, f"Latest file: {latest_file.name}", latest_file
+        except Exception as e:
+            logger.error(f"Error getting latest file: {e}")
+            return False, f"Failed to inspect folder: {e}", None
+
+    def smart_resolve_file(self, query: str, folder_hint: str = None) -> Tuple[bool, str, Optional[Path]]:
+        """
+        Smart Natural Language File Resolver.
+        Resolves queries like:
+        - "Downloads me photo jo aaj download kiya"
+        - "Latest PDF file on Desktop"
+        - "Recent document"
+        """
+        if not query or not query.strip():
+            return self.get_latest_file(folder_alias=folder_hint or "downloads")
+
+        query_clean = query.lower().strip()
+
+        # 1. Detect Category / Extensions
+        target_exts = set()
+        image_keywords = ["photo", "image", "picture", "screenshot", "pic", "img", "photograph"]
+        doc_keywords = ["pdf", "doc", "document", "text", "file", "report", "csv", "excel", "sheet"]
+        video_keywords = ["video", "clip", "movie", "mp4"]
+
+        if any(k in query_clean for k in image_keywords):
+            target_exts.update([".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"])
+        if any(k in query_clean for k in doc_keywords):
+            target_exts.update([".pdf", ".docx", ".doc", ".txt", ".xlsx", ".csv"])
+        if any(k in query_clean for k in video_keywords):
+            target_exts.update([".mp4", ".mkv", ".mov", ".avi"])
+
+        # 2. Detect Time Filter ("aaj", "today", "latest", "recent", "abhi")
+        is_today = any(k in query_clean for k in ["aaj", "today", "aaj ki"])
+        is_latest = any(k in query_clean for k in ["latest", "recent", "last", "abhi", "new", "nayi", "naya"])
+
+        # Determine target folder
+        target_folder = folder_hint
+        if not target_folder:
+            for alias in ["downloads", "desktop", "documents", "pictures"]:
+                if alias in query_clean:
+                    target_folder = alias
+                    break
+
+        search_dir = self.resolve_folder_alias(target_folder or "downloads")
+
+        if not search_dir.exists():
+            return False, f"Directory '{search_dir}' does not exist.", None
+
+        # Scan files in directory
+        import time
+        now = time.time()
+        matching_files = []
+
+        try:
+            for root, _, files in os.walk(search_dir):
+                for f in files:
+                    p = Path(root) / f
+                    if not p.is_file():
+                        continue
+
+                    ext = p.suffix.lower()
+                    mtime = p.stat().st_mtime
+                    age_seconds = now - mtime
+
+                    # Match extensions if category was detected
+                    if target_exts and ext not in target_exts:
+                        continue
+
+                    # Match time if 'aaj/today' requested (within last 24 hours)
+                    if is_today and age_seconds > 86400:
+                        continue
+
+                    matching_files.append((mtime, p))
+
+        except Exception as e:
+            logger.error(f"Error scanning directory '{search_dir}': {e}")
+
+        if matching_files:
+            # Sort by newest modification time
+            matching_files.sort(key=lambda x: x[0], reverse=True)
+            best_file = matching_files[0][1]
+            logger.info(f"🎯 Smart resolved file: '{best_file.name}' from query '{query}'")
+            return True, f"Resolved file: {best_file.name}", best_file
+
+        return False, f"No matching file found for query '{query}'.", None
+
+    def copy_file(self, source_query: str, dest_folder: str) -> Tuple[bool, str]:
+        """Search and copy a file to a destination folder."""
+        found, msg, src_path = self.find_file(source_query)
+        if not found or not src_path:
+            return False, f"Copy failed: {msg}"
+
+        dest_dir = self.resolve_folder_alias(dest_folder)
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest_path = dest_dir / src_path.name
+
+        try:
+            shutil.copy2(src_path, dest_path)
+            if dest_path.exists() and dest_path.stat().st_size == src_path.stat().st_size:
+                return True, f"Successfully copied '{src_path.name}' to '{dest_dir.name}'."
+            return False, "File copy verification failed: sizes do not match."
+        except Exception as e:
+            return False, f"Copy error: {e}"
+
+    def list_files(self, folder_or_query: str = "downloads") -> str:
+        """List contents of a specified folder or alias."""
+        target_dir = self.resolve_folder_alias(folder_or_query)
+        if not target_dir.exists():
+            return f"Folder '{target_dir}' does not exist."
+
+        try:
+            items = os.listdir(target_dir)
             if not items:
-                return f"📁 {path.name} — folder khali hai boss."
+                return f"Folder '{target_dir.name}' is empty."
+            
+            files = [f"• {item}" for item in items[:20]]
+            return f"Contents of '{target_dir.name}' ({len(items)} items):\n" + "\n".join(files)
+        except Exception as e:
+            return f"Failed to list files: {e}"
 
-            lines = [f"📁 {path.name}/ ({len([i for i in items if i.is_dir()])} folders, {len([i for i in items if i.is_file()])} files)"]
-            for item in items[:30]:
-                icon = self.file_icons.get("folder", "📁") if item.is_dir() else self._get_file_icon(item)
-                size = ""
-                if item.is_file():
+    def list_files_by_relative_date(self, folder_alias: str = "downloads", days_ago: int = 0) -> Tuple[bool, str, List[Path]]:
+        """
+        List files created or modified N days ago (e.g. days_ago=2 for '2 din pehle', days_ago=1 for 'kal/yesterday', days_ago=0 for 'aaj/today').
+        """
+        search_dir = self.resolve_folder_alias(folder_alias)
+        if not search_dir.exists():
+            return False, f"Directory '{search_dir}' does not exist.", []
+
+        import time
+        from datetime import datetime, timedelta
+        
+        now = datetime.now()
+        target_date = (now - timedelta(days=days_ago)).date()
+
+        matching_files = []
+        try:
+            for root, dirs, files in os.walk(search_dir):
+                for item in files + dirs:
+                    p = Path(root) / item
                     try:
-                        sz = item.stat().st_size
-                        size = f" ({sz:,} bytes)" if sz < 1024*1024 else f" ({sz/(1024*1024):.1f} MB)"
+                        mtime = p.stat().st_mtime
+                        item_date = datetime.fromtimestamp(mtime).date()
+                        if item_date == target_date:
+                            matching_files.append(p)
                     except Exception:
                         pass
-                lines.append(f"  {icon} {item.name}{size}")
-
-            if len(items) > 30:
-                lines.append(f"  ... aur {len(items) - 30} items aur hain boss")
-
-            return "\n".join(lines)
-
         except Exception as e:
-            logger.error(f"list_files error: {e}")
-            return f"Files list karne mein error boss: {str(e)}"
+            logger.error(f"Error scanning directory for date filter: {e}")
 
-    # ═══════════════════════════════════════════
-    # SKILL: read_file
-    # ═══════════════════════════════════════════
+        date_label = "today" if days_ago == 0 else ("yesterday" if days_ago == 1 else f"{days_ago} days ago")
+        if matching_files:
+            file_names = [f"• {p.name}" for p in matching_files[:15]]
+            summary = f"Files/folders modified in '{search_dir.name}' {date_label}:\n" + "\n".join(file_names)
+            return True, summary, matching_files
 
-    def read_file(self, *args) -> str:
+        return False, f"No files or folders found in '{search_dir.name}' modified {date_label}.", []
+
+    def move_file(self, source_query: str, dest_folder: str) -> Tuple[bool, str]:
+        """Search and move a file to a destination folder."""
+        found, msg, src_path = self.find_file(source_query)
+        if not found or not src_path:
+            return False, f"Move failed: {msg}"
+
+        dest_dir = self.resolve_folder_alias(dest_folder)
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest_path = dest_dir / src_path.name
+
         try:
-            if not args:
-                return "File path do boss."
-            filepath_str = args[0]
-            filepath = Path(filepath_str).expanduser().resolve()
-            if not filepath.is_absolute():
-                filepath = self.search_dirs[0] / filepath_str
-            if not filepath.exists():
-                return f"File nahi mila boss: {filepath_str}"
-
-            content = self._read_file_safe(filepath)
-            lines = content.split('\n')
-            total_lines = len(lines)
-            icon = self._get_file_icon(filepath)
-
-            header = f"📄 {filepath.name} {icon} ({total_lines} lines, {len(content):,} chars)"
-
-            if total_lines > 100:
-                preview = '\n'.join(lines[:50])
-                return f"{header}\n\n{preview}\n\n... ({total_lines - 50} aur lines hain boss, complete file read ke liye code review kar sakta hoon)"
-            else:
-                return f"{header}\n\n{content}"
-
+            shutil.move(str(src_path), str(dest_path))
+            if dest_path.exists():
+                return True, f"Successfully moved '{src_path.name}' to '{dest_dir.name}'."
+            return False, "File move verification failed."
         except Exception as e:
-            logger.error(f"read_file error: {e}")
-            return f"File padhne mein error boss: {str(e)}"
+            return False, f"Move error: {e}"
 
-    # ═══════════════════════════════════════════
-    # SKILL: edit_file
-    # ═══════════════════════════════════════════
+# Singleton accessor
+_file_manager: Optional[SmartFileManager] = None
 
-    def edit_file(self, *args) -> str:
-        try:
-            if len(args) < 3:
-                return "Usage: edit_file:filepath:old_text:new_text boss."
-
-            filepath_str = args[0]
-            old_text = args[1]
-            new_text = args[2] if len(args) > 2 else ""
-
-            filepath = Path(filepath_str).expanduser().resolve()
-            if not filepath.is_absolute():
-                filepath = self.search_dirs[0] / filepath_str
-            if not filepath.exists():
-                return f"File nahi mila boss: {filepath_str}"
-
-            content = filepath.read_text(encoding='utf-8', errors='replace')
-            if old_text not in content:
-                return f"'{old_text[:30]}' text file mein nahi mila boss."
-
-            new_content = content.replace(old_text, new_text, 1)
-            backup_path = filepath.with_suffix(filepath.suffix + '.backup')
-            filepath.rename(backup_path)
-            filepath.write_text(new_content, encoding='utf-8')
-
-            return f"Edit ho gayi boss. Backup: {backup_path.name}"
-
-        except Exception as e:
-            logger.error(f"edit_file error: {e}")
-            return f"File edit karne mein error boss: {str(e)}"
-
-    # ═══════════════════════════════════════════
-    # SKILL: search_files
-    # ═══════════════════════════════════════════
-
-    def search_files(self, *args) -> str:
-        try:
-            query = " ".join(args).strip() if args else ""
-            if not query:
-                return "Kya search karna hai boss?"
-
-            results = []
-            for search_dir in self.search_dirs:
-                if not search_dir.exists():
-                    continue
-                try:
-                    for item in search_dir.rglob("*"):
-                        if item.is_file() and query.lower() in item.name.lower():
-                            results.append(item)
-                            if len(results) >= 20:
-                                break
-                        if item.is_file() and len(results) < 20:
-                            try:
-                                content = item.read_text(encoding='utf-8', errors='replace')
-                                if query.lower() in content.lower():
-                                    results.append(item)
-                            except Exception:
-                                pass
-                    if len(results) >= 20:
-                        break
-                except PermissionError:
-                    continue
-
-            if not results:
-                return f"'{query}' ke liye kuch nahi mila boss."
-
-            lines = [f"🔍 {len(results)} results for '{query}':"]
-            for r in results[:10]:
-                rel = self._make_relative(r)
-                icon = self._get_file_icon(r)
-                lines.append(f"  {icon} {rel}")
-            if len(results) > 10:
-                lines.append(f"  ... aur {len(results) - 10} results hain boss")
-
-            return "\n".join(lines)
-
-        except Exception as e:
-            logger.error(f"search_files error: {e}")
-            return f"Search mein error boss: {str(e)}"
-
-
-# Singleton
-_file_manager: Optional[FileManager] = None
-
-
-def get_file_manager(config) -> FileManager:
+def get_file_manager() -> SmartFileManager:
     global _file_manager
     if _file_manager is None:
-        _file_manager = FileManager(config)
+        _file_manager = SmartFileManager()
     return _file_manager
