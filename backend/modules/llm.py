@@ -101,6 +101,13 @@ RESPONSE STYLE
 - End with an action or short question — never trail off.
 - Silences are okay. Not every reply needs padding.
 
+SYSTEM PATHS & STORAGE FACTS:
+- Screenshots Storage: Screenshots taken by MAX are saved in `C:/Users/sanke/OneDrive/Desktop/Jarvis/backend/data/screenshots` (or `backend/data/screenshots`). If the user asks where screenshots or captured images are saved, answer directly with this exact folder path!
+- Downloads Path: C:/Users/sanke/Downloads
+- Desktop Path: C:/Users/sanke/OneDrive/Desktop
+- Documents Path: C:/Users/sanke/OneDrive/Documents
+- Workspace Path: C:/Users/sanke/OneDrive/Desktop/Jarvis
+
 GREETING & CASUAL CONVERSATION
 These are DIRECT replies — NO skill tag needed:
 - hi/hello/hey -> "Hey! What are we getting into today?"
@@ -163,9 +170,11 @@ kb_rebuild, research, create_file, media, open_link, open_link_select, find_and_
 search_files, list_windows, list_apps, sysinfo, time_now, date_today, screenshot, screen_record, plugin_list, plugin_reload, clear_memory, 
 add_rule, project_scaffold, code_review, fix_code, type_text, whatsapp_message, whatsapp_screenshot, quit_max, ai_ask, ai_chain, count, do research,
 save_as, rename_file, delete_file, move_file, copy_file, open_file, note_delete, note_clear, alarm,
-wifi_toggle, bluetooth_toggle, night_light, uptime, check_process
+wifi_toggle, bluetooth_toggle, night_light, uptime, check_process, get_recent_history
 
 DECISION GUIDE
+- Recall past conversation / what was discussed earlier? -> [SKILL:get_recent_history:20]
+  Example: "Pehle humne kya baat ki thi?" -> "Let me recall our recent conversation history! [SKILL:get_recent_history:20]"
 - Count numbers? -> [SKILL:count:<start>:<end>:<reverse_true_or_false>]
   CRITICAL: You MUST use the [SKILL:count] tag. NEVER count using plain text (e.g., do not say "one, two, three").
   Example: "Count to 100" -> "Sure! [SKILL:count:1:100:false]"
@@ -475,8 +484,8 @@ async def get_response(user_text: str, memory_context: str = "", allow_skills: b
                 if end == -1:
                     break
                 # Check if this is a valid skill tag (contains a colon after SKILL:)
-                inner = raw[start+7:end]
-                if ":" in inner:
+                inner = raw[start+7:end].strip()
+                if inner:
                     skills_found.append(raw[start:end+1])
                 i = end + 1
             
@@ -535,40 +544,77 @@ async def get_response_with_skill_result(user_text: str, skill_result_text: str,
 
 async def analyze_image_with_prompt(image_path: str, user_prompt: str) -> str:
     """
-    Vision Model via Groq's Llama 4 Scout.
-    Improved error handling and retry.
+    Vision Model analysis powered by Gemini Vision (gemini-flash-latest).
+    Uses Gemini REST API with zero external dependencies for maximum speed and accuracy.
     """
     try:
-        # Check file size
+        if not os.path.exists(image_path):
+            return "Error: Image file not found for screen reading."
+
+        # Resize image if larger than 5MB
         file_size = os.path.getsize(image_path)
-        if file_size > 10 * 1024 * 1024:  # 10MB limit
-            # Resize image
+        if file_size > 5 * 1024 * 1024:
             from PIL import Image
             with Image.open(image_path) as img:
-                img.thumbnail((1024, 1024), Image.Resampling.LANCZOS)
+                img.thumbnail((1280, 1280), Image.Resampling.LANCZOS)
                 resized_path = image_path + ".resized.jpg"
-                img.save(resized_path, "JPEG", quality=75)
+                img.save(resized_path, "JPEG", quality=80)
                 image_path = resized_path
-        
-        with open(image_path, "rb") as f:
-            b64 = base64.b64encode(f.read()).decode("utf-8")
 
+        with open(image_path, "rb") as f:
+            b64_data = base64.b64encode(f.read()).decode("utf-8")
+
+        gemini_key = getattr(config, "GEMINI_API_KEY", "") or os.getenv("GEMINI_API_KEY", "")
+        vision_model = getattr(config, "GEMINI_VISION_MODEL", "gemini-flash-latest")
+        if not vision_model or "Qwen" in vision_model or "llama" in vision_model:
+            vision_model = "gemini-flash-latest"
+
+        if gemini_key:
+            import httpx
+            candidate_models = [
+                vision_model,
+                f"models/{vision_model}" if not vision_model.startswith("models/") else vision_model,
+                "models/gemini-1.5-flash",
+                "models/gemini-flash-latest",
+                "gemini-1.5-flash",
+            ]
+            seen = set()
+            unique_candidates = [m for m in candidate_models if m and not (m in seen or seen.add(m))]
+
+            async with httpx.AsyncClient(timeout=30) as client:
+                for model_candidate in unique_candidates:
+                    endpoint_path = model_candidate if model_candidate.startswith("models/") else f"models/{model_candidate}"
+                    url = f"https://generativelanguage.googleapis.com/v1beta/{endpoint_path}:generateContent?key={gemini_key}"
+                    payload = {
+                        "contents": [{
+                            "parts": [
+                                {"text": user_prompt},
+                                {"inline_data": {"mime_type": "image/jpeg", "data": b64_data}}
+                            ]
+                        }]
+                    }
+                    r = await client.post(url, json=payload)
+                    if r.status_code == 200:
+                        data = r.json()
+                        candidates = data.get("candidates", [])
+                        if candidates and "content" in candidates[0]:
+                            parts = candidates[0]["content"].get("parts", [])
+                            if parts and "text" in parts[0]:
+                                return parts[0]["text"].strip()
+                    logger.warning(f"Gemini Vision REST model '{model_candidate}' returned status {r.status_code}: {r.text[:150]}")
+
+        # Fallback to Groq if Gemini key not present
         async def call():
             client = await get_client()
             return await client.chat.completions.create(
-                model="meta-llama/llama-4-scout-17b-16e-instruct",
-                messages=[{"role": "user", "content": [
-                    {"type": "text", "text": user_prompt},
-                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
-                ]}],
-                temperature=0.6,
-                max_tokens=2048,  # Increased for detailed analysis
+                model=config.LLM_MODEL,
+                messages=[{"role": "user", "content": user_prompt}],
+                max_tokens=1024,
             )
-        
-        resp = await asyncio.wait_for(execute_with_retry(call, max_retries=2), timeout=30.0)
+        resp = await execute_with_retry(call, max_retries=1)
         return resp.choices[0].message.content.strip()
 
     except Exception as e:
         import traceback
         logger.error(f"Vision failed: {e}\n{traceback.format_exc()}")
-        return f"Vision analysis error: {str(e)}"
+        return f"Screen vision error: {str(e)}"
