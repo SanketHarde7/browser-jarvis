@@ -79,19 +79,27 @@ AVAILABLE SKILLS (use EXACT names):
 {skills}
 
 SKILL TAG FORMAT: [SKILL:skill_name:param1:param2]
-- For counting: [SKILL:count:<start>:<end>:<reverse_true_or_false>] (e.g. [SKILL:count:1:5:false])
+
+EXAMPLES:
+- Open Downloads folder: [SKILL:open_app:downloads]
+- Take screenshot of Downloads folder & WhatsApp to contact: [SKILL:folder_screenshot_whatsapp:downloads|contact_name]
+- List files downloaded yesterday: [SKILL:file_list_by_date:downloads|1]
+- Open app/folder + screenshot: [SKILL:open_app:downloads] [SKILL:screenshot:ss_name:desktop]
 
 RULES:
 - Each step performs exactly ONE action with ONE skill tag, OR is a pure reasoning/summarizing step with skill set to null.
 - Later steps may use the result of an earlier step by writing {step_N} inside a parameter. Example: [SKILL:note:{step_1}]
 - Order steps by real dependency — a step that needs data must come AFTER the step that fetches it.
 - Do NOT invent extra steps, confirmations, or actions the user never asked for.
-- Everyday practical actions only.
 
 USER GOAL: "{goal}"
 
-Respond ONLY with valid JSON, no other text:
-{"steps": [{"id": 1, "description": "short human description", "skill": "[SKILL:...]" }]}
+Respond ONLY with valid JSON (no markdown backticks, no extra text):
+{
+  "steps": [
+    { "id": 1, "description": "short human description", "skill": "[SKILL:...]" }
+  ]
+}
 Use null for the skill of pure reasoning steps."""
 
 
@@ -158,8 +166,8 @@ class AgentLoop:
 
     # ── LLM helper ──────────────────────────────────────
 
-    async def _call_llm(self, prompt: str, max_tokens: int = 600,
-                        temperature: float = 0.2) -> str:
+    async def _call_llm(self, prompt: str, max_tokens: int = 1200,
+                        temperature: float = 0.1) -> str:
         from modules.llm import get_client
 
         async def call():
@@ -176,15 +184,23 @@ class AgentLoop:
 
     @staticmethod
     def _extract_json(raw: str) -> Optional[dict]:
+        if not raw:
+            return None
+        clean = raw.strip()
+        clean = re.sub(r"^```(?:json)?\s*", "", clean, flags=re.IGNORECASE)
+        clean = re.sub(r"\s*```$", "", clean).strip()
+        
         try:
-            return json.loads(raw)
+            return json.loads(clean)
         except json.JSONDecodeError:
-            m = re.search(r"\{.*\}", raw, re.DOTALL)
-            if m:
-                try:
-                    return json.loads(m.group(0))
-                except json.JSONDecodeError:
-                    return None
+            pass
+
+        m = re.search(r"\{.*\}", clean, re.DOTALL)
+        if m:
+            try:
+                return json.loads(m.group(0))
+            except json.JSONDecodeError:
+                pass
         return None
 
     def _skill_names(self) -> str:
