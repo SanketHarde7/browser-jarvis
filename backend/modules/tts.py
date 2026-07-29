@@ -5,6 +5,7 @@ tts.py — MAX v5.3 (Kokoro Local Offline TTS Integration)
 Replaced Edge-TTS with Kokoro for zero-limit, expressive local audio.
 """
 import os
+import re
 import asyncio
 import logging
 import tempfile
@@ -61,56 +62,77 @@ _engine = LocalVoiceEngine.get_instance()
 _tts_lock = asyncio.Lock()
 
 async def generate_tts(text: str, voice: str = "", output_path: str = "") -> str:
-    """Generate TTS audio using local Kokoro and return the file path."""
+    """Generate TTS audio using local Kokoro with edge-tts fallback."""
     if not text or not text.strip():
         logger.warning("TTS called with empty text, skipping.")
         return ""
 
-    if not _engine.is_ready or not _engine.pipeline:
-        logger.warning("Kokoro Engine is still loading. Falling back to silent/empty.")
+    if not output_path:
+        tmp = tempfile.NamedTemporaryFile(suffix=".mp3" if not (_engine.is_ready and _engine.pipeline) else ".wav", delete=False)
+        output_path = tmp.name
+        tmp.close()
+
+    # Clean text for Kokoro phoneme tokenizer (strip markdown, emojis, special symbols)
+    clean_text = re.sub(r"```[\s\S]*?```", "", text)
+    clean_text = re.sub(r"`[^`]*`", "", clean_text)
+    clean_text = re.sub(r"[#*_~`\[\]()<>@$%^&+=|{\}]", " ", clean_text)
+    clean_text = re.sub(r"\s+", " ", clean_text).strip()
+
+    if not clean_text:
         return ""
 
-    async with _tts_lock:
-        try:
-            # Clean text for better pronunciation and remove markdown
-            clean_text = text.replace("*", "").replace("#", "").strip()
-            
-            if not output_path:
-                # Kokoro works best with .wav
-                tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-                output_path = tmp.name
-                tmp.close()
+    # Attempt Kokoro generation if engine is ready
+    if _engine.is_ready and _engine.pipeline:
+        async with _tts_lock:
+            try:
+                chosen_voice = voice if voice else _engine.voice_name
 
-            chosen_voice = voice if voice else _engine.voice_name
+                def _generate_audio_file():
+                    generator = _engine.pipeline(clean_text, voice=chosen_voice, speed=1.0, split_pattern=r'\n+')
+                    audio_chunks = []
+                    for i, (graphemes, phonemes, audio) in enumerate(generator):
+                        audio_chunks.append(audio)
+                    if audio_chunks:
+                        full_audio = np.concatenate(audio_chunks)
+                        wav_path = output_path if output_path.endswith(".wav") else output_path + ".wav"
+                        sf.write(wav_path, full_audio, 24000)
+                        return wav_path
+                    return ""
 
-            # Run generation in a background thread so it doesn't block FastAPI/Uvicorn
-            def _generate_audio_file():
-                generator = _engine.pipeline(clean_text, voice=chosen_voice, speed=1.0, split_pattern=r'\n+')
-                audio_chunks = []
-                
-                for i, (graphemes, phonemes, audio) in enumerate(generator):
-                    audio_chunks.append(audio)
-                
-                if audio_chunks:
-                    # Concatenate all lines into one single audio array
-                    full_audio = np.concatenate(audio_chunks)
-                    # Save to WAV file at 24000Hz (Kokoro's native sample rate)
-                    sf.write(output_path, full_audio, 24000)
-                    return True
-                return False
+                res_path = await asyncio.to_thread(_generate_audio_file)
+                if res_path and os.path.exists(res_path):
+                    logger.info(f"Kokoro TTS generated successfully: {res_path}")
+                    return res_path
+            except Exception as e:
+                logger.warning(f"Kokoro TTS generation failed: {e}. Falling back to edge-tts.")
 
-            success = await asyncio.to_thread(_generate_audio_file)
+    # Fallback 2: Edge-TTS
+    try:
+        import edge_tts
+        mp3_path = output_path if output_path.endswith(".mp3") else output_path + ".mp3"
+        tts_voice = voice if voice else getattr(config, "TTS_VOICE_HINDI", "hi-IN-SwaraNeural")
+        communicate = edge_tts.Communicate(clean_text[:400], tts_voice)
+        await communicate.save(mp3_path)
+        if os.path.exists(mp3_path) and os.path.getsize(mp3_path) > 0:
+            logger.info(f"Edge-TTS generated successfully: {mp3_path}")
+            return mp3_path
+    except Exception as fallback_err:
+        logger.warning(f"Edge-TTS fallback failed: {fallback_err}")
 
-            if success and os.path.exists(output_path):
-                logger.info(f"Kokoro TTS generated successfully: {output_path}")
-                return output_path
-            
-            return ""
+    # Fallback 3: Pyttsx3 (Windows Native Offline SAPI5 TTS)
+    try:
+        import pyttsx3
+        wav_path = output_path if output_path.endswith(".wav") else output_path + ".wav"
+        engine = pyttsx3.init()
+        engine.save_to_file(clean_text[:300], wav_path)
+        engine.runAndWait()
+        if os.path.exists(wav_path) and os.path.getsize(wav_path) > 0:
+            logger.info(f"Pyttsx3 native offline TTS generated successfully: {wav_path}")
+            return wav_path
+    except Exception as pyttsx_err:
+        logger.warning(f"Pyttsx3 fallback failed: {pyttsx_err}")
 
-        except Exception as e:
-            import traceback
-            logger.error(f"Kokoro TTS generation failed: {e}\n{traceback.format_exc()}")
-            return ""
+    return ""
 
 
 async def generate_tts_paced(text: str, pause_seconds: float = 0.8, voice: str = "", output_path: str = "") -> str:
