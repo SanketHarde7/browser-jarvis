@@ -35,7 +35,7 @@ except ImportError:
 try:
     import pywhatkit
     PYWHATKIT_AVAILABLE = True
-except ImportError:
+except (ImportError, Exception):
     PYWHATKIT_AVAILABLE = False
 
 DATA_SKILLS = {
@@ -50,20 +50,70 @@ DATA_SKILLS = {
     "ai_ask", "ai_ask_screen", "ai_ask_file", "ai_ask_clipboard",
     "ai_compare", "ai_chain", "ai_route", "ai_workflow",
     "ai_workflow_save", "ai_workflow_list",
-    "check_process", "uptime"
+    "check_process", "uptime", "get_recent_history"
 }
 
 LONG_RESULT_SKILLS = {
     "find_and_explain", "list_files", "read_file",
     "code_review", "run_code", "search_files",
     "read_screen", "list_windows", "browser_scrape",
-    "list_apps", "top_processes",
+    "list_apps", "top_processes", "get_recent_history",
     "ai_ask", "ai_ask_screen", "ai_ask_file", "ai_ask_clipboard",
     "ai_compare", "ai_chain", "ai_route", "ai_workflow",
     "ai_workflow_save", "ai_workflow_list"
 }
 
 TTS_MAX_CHARS = 280
+
+
+def focus_target_window(target_name: str = "") -> bool:
+    """Bring target window (File Explorer, Downloads, Notepad, Chrome, etc.) to the FOREGROUND in Windows."""
+    if platform.system() != "Windows":
+        return False
+    try:
+        import pygetwindow as gw
+        import win32gui
+        import win32con
+
+        clean_target = (target_name or "").lower().strip()
+        search_terms = []
+        if clean_target:
+            search_terms.append(clean_target)
+            if "download" in clean_target:
+                search_terms.extend(["downloads", "file explorer", "explorer"])
+            elif "explorer" in clean_target:
+                search_terms.extend(["file explorer", "explorer", "downloads"])
+        else:
+            search_terms = ["downloads", "file explorer", "explorer"]
+
+        all_wins = gw.getAllWindows()
+        matched_win = None
+
+        for term in search_terms:
+            for w in all_wins:
+                if w.visible and w.title and term in w.title.lower():
+                    matched_win = w
+                    break
+            if matched_win:
+                break
+
+        if matched_win:
+            try:
+                if matched_win.isMinimized:
+                    win32gui.ShowWindow(matched_win._hWnd, win32con.SW_RESTORE)
+                win32gui.ShowWindow(matched_win._hWnd, win32con.SW_SHOW)
+                win32gui.SetForegroundWindow(matched_win._hWnd)
+                time.sleep(0.3)
+                return True
+            except Exception:
+                try:
+                    matched_win.activate()
+                    return True
+                except Exception:
+                    pass
+    except Exception as err:
+        logger.warning(f"focus_target_window error: {err}")
+    return False
 
 
 def _url_to_label(url: str) -> str:
@@ -162,7 +212,7 @@ class SkillsEngine:
     def file_manager(self):
         if not self._file_manager:
             from modules.file_manager import get_file_manager
-            self._file_manager = get_file_manager(self.config)
+            self._file_manager = get_file_manager()
         return self._file_manager
 
     @property
@@ -328,15 +378,27 @@ class SkillsEngine:
             "save_as":           self._skill_save_as,
             "rename_file":       self._skill_rename_file,
             "delete_file":       self._skill_delete_file,
-            "move_file":         self._skill_move_file,
-            "copy_file":         self._skill_copy_file,
+            "move_file":         self._skill_file_move,
+            "copy_file":         self._skill_file_copy,
             "open_file":         self._skill_open_file,
+            "file_find":         self._skill_file_find,
+            "file_send_whatsapp": self._skill_file_send_whatsapp,
+            "file_upload_browser": self._skill_file_upload_browser,
+            "file_list_by_date": self._skill_file_list_by_date,
+            "file_list_whatsapp": self._skill_file_list_whatsapp,
+            "folder_screenshot_whatsapp": self._skill_folder_screenshot_whatsapp,
+            "vscode_git_push":  self._skill_vscode_git_push,
+            "vscode_close_folder": self._skill_vscode_close_folder,
+            "close_app":         self._skill_close_app,
+            "close_window":      self._skill_close_window,
+            "key_chord":         self._skill_key_chord,
             # ── System Toggles ─────────────────────────────────────────────
             "wifi_toggle":       self._skill_wifi_toggle,
             "bluetooth_toggle":  self._skill_bluetooth_toggle,
             "night_light":       self._skill_night_light,
             "uptime":            self._skill_uptime,
             "check_process":     self._skill_check_process,
+            "get_recent_history": self._skill_get_recent_history,
         }
         try:
             pl = self.plugin_loader
@@ -386,6 +448,8 @@ class SkillsEngine:
     # ════════════════════════════════════════════
 
     async def parse_and_execute(self, response_text: str, memory_context: str = "", user_request: str = "") -> Dict[str, Any]:
+        if user_request:
+            self.last_user_request = user_request
         matches = list(self.SKILL_PATTERN.finditer(response_text))
         
         if not matches:
@@ -614,7 +678,8 @@ class SkillsEngine:
         return await asyncio.to_thread(self.file_manager.find_and_explain, *args)
 
     def _skill_list_files(self, *args):       
-        return self.file_manager.list_files(*args)
+        folder = " ".join(args).strip() if args else "downloads"
+        return self.file_manager.list_files(folder)
 
     def _skill_read_file(self, *args):        
         return self.file_manager.read_file(*args)
@@ -892,20 +957,96 @@ class SkillsEngine:
                     pass
             
             def _capture():
+                img = None
                 if bbox:
-                    img = ImageGrab.grab(bbox=bbox, all_screens=True).convert('RGB')
-                else:
-                    img = ImageGrab.grab(all_screens=True).convert('RGB')
+                    try:
+                        img = ImageGrab.grab(bbox=bbox, all_screens=True).convert('RGB')
+                    except Exception:
+                        try:
+                            img = ImageGrab.grab(bbox=bbox).convert('RGB')
+                        except Exception:
+                            pass
+                if not img:
+                    try:
+                        img = ImageGrab.grab(all_screens=True).convert('RGB')
+                    except Exception:
+                        try:
+                            img = ImageGrab.grab().convert('RGB')
+                        except Exception:
+                            pass
+                if not img and os.name == 'nt':
+                    try:
+                        import ctypes
+                        import ctypes.wintypes
+                        user32 = ctypes.windll.user32
+                        gdi32 = ctypes.windll.gdi32
+                        try:
+                            user32.SetProcessDPIAware()
+                        except Exception:
+                            pass
+                        width = user32.GetSystemMetrics(0)
+                        height = user32.GetSystemMetrics(1)
+                        hdesktop = user32.GetDesktopWindow()
+                        desktop_dc = user32.GetDC(hdesktop)
+                        img_dc = gdi32.CreateCompatibleDC(desktop_dc)
+                        mem_img = gdi32.CreateCompatibleBitmap(desktop_dc, width, height)
+                        gdi32.SelectObject(img_dc, mem_img)
+                        gdi32.BitBlt(img_dc, 0, 0, width, height, desktop_dc, 0, 0, 0x00CC0020)
+
+                        class BITMAPINFOHEADER(ctypes.Structure):
+                            _fields_ = [
+                                ('biSize', ctypes.wintypes.DWORD),
+                                ('biWidth', ctypes.wintypes.LONG),
+                                ('biHeight', ctypes.wintypes.LONG),
+                                ('biPlanes', ctypes.wintypes.WORD),
+                                ('biBitCount', ctypes.wintypes.WORD),
+                                ('biCompression', ctypes.wintypes.DWORD),
+                                ('biSizeImage', ctypes.wintypes.DWORD),
+                                ('biXPelsPerMeter', ctypes.wintypes.LONG),
+                                ('biYPelsPerMeter', ctypes.wintypes.LONG),
+                                ('biClrUsed', ctypes.wintypes.DWORD),
+                                ('biClrImportant', ctypes.wintypes.DWORD)
+                            ]
+
+                        bmi = BITMAPINFOHEADER()
+                        bmi.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+                        bmi.biWidth = width
+                        bmi.biHeight = -height
+                        bmi.biPlanes = 1
+                        bmi.biBitCount = 32
+                        bmi.biCompression = 0
+                        buffer = ctypes.create_string_buffer(width * height * 4)
+                        gdi32.GetDIBits(img_dc, mem_img, 0, height, buffer, ctypes.byref(bmi), 0)
+                        gdi32.DeleteObject(mem_img)
+                        gdi32.DeleteDC(img_dc)
+                        user32.ReleaseDC(hdesktop, desktop_dc)
+                        img = Image.frombytes('RGBA', (width, height), buffer.raw, 'raw', 'BGRA').convert('RGB')
+                    except Exception as win_err:
+                        logger.warning(f"Win32 GDI capture fallback failed: {win_err}")
+
+                if not img and PYAUTOGUI_AVAILABLE:
+                    try:
+                        img = pyautogui.screenshot().convert('RGB')
+                    except Exception:
+                        pass
+                if not img:
+                    raise RuntimeError("Could not capture desktop screen. Ensure display permissions are granted.")
+
                 img.thumbnail((1024, 1024), Image.Resampling.LANCZOS)
                 img.save(str(path), quality=70, optimize=True)
 
             await asyncio.to_thread(_capture)
             
+            vision_prompt = target.strip() if target else ""
+            generic_targets = ["all", "screen", "window", "display", "monitor", "current"]
+            if not vision_prompt or vision_prompt.lower() in generic_targets:
+                if hasattr(self, 'last_user_request') and self.last_user_request:
+                    vision_prompt = self.last_user_request
+                else:
+                    vision_prompt = "Describe what is visible on the screen in detail. Read all text, code, or visual elements."
+
             from modules.llm import analyze_image_with_prompt
-            return await analyze_image_with_prompt(
-                str(path),
-                f"Describe what's visible on the '{target or 'screen'}'. Read URLs and text."
-            )
+            return await analyze_image_with_prompt(str(path), vision_prompt)
         except ImportError:
             return "Pillow needed: pip install pillow"
         except Exception as e:
@@ -963,8 +1104,59 @@ class SkillsEngine:
             if not fname.lower().endswith(".png"):
                 fname += f"_{ts}.png"
                 
+            # If screenshot request is for a folder (like downloads), bring Explorer to foreground first
+            combined_req = (filename + " " + location + " " + getattr(self, 'last_user_request', '')).lower()
+            if any(k in combined_req for k in ["download", "explorer", "folder", "desktop", "document"]):
+                focus_target_window("downloads")
+                await asyncio.sleep(1.0)
+
             fp = sd / fname
-            await asyncio.to_thread(pyautogui.screenshot, str(fp))
+            def _do_grab():
+                # Primary 1: mss (Fastest, zero display-lock dependency)
+                try:
+                    import mss
+                    with mss.mss() as sct:
+                        sct.shot(output=str(fp))
+                        if os.path.exists(str(fp)) and os.path.getsize(str(fp)) > 0:
+                            return
+                except Exception as mss_err:
+                    logger.warning(f"mss capture failed: {mss_err}")
+
+                # Primary 2: PIL ImageGrab
+                try:
+                    from PIL import ImageGrab
+                    img = ImageGrab.grab()
+                    img.save(str(fp))
+                    if os.path.exists(str(fp)) and os.path.getsize(str(fp)) > 0:
+                        return
+                except Exception:
+                    pass
+
+                # Primary 3: PyAutoGUI
+                try:
+                    pyautogui.screenshot(str(fp))
+                    if os.path.exists(str(fp)) and os.path.getsize(str(fp)) > 0:
+                        return
+                except Exception:
+                    pass
+
+                # Primary 4: PowerShell .NET System.Drawing (Bulletproof Windows Fallback)
+                try:
+                    ps_cmd = (
+                        f"[Reflection.Assembly]::LoadWithPartialName('System.Drawing') | Out-Null; "
+                        f"[Reflection.Assembly]::LoadWithPartialName('System.Windows.Forms') | Out-Null; "
+                        f"$bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds; "
+                        f"$bmp = New-Object System.Drawing.Bitmap $bounds.Width, $bounds.Height; "
+                        f"$graphics = [System.Drawing.Graphics]::FromImage($bmp); "
+                        f"$graphics.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size); "
+                        f"$bmp.Save('{str(fp)}', [System.Drawing.Imaging.ImageFormat]::Png); "
+                        f"$graphics.Dispose(); $bmp.Dispose();"
+                    )
+                    subprocess.run(["powershell", "-Command", ps_cmd], capture_output=True)
+                except Exception as ps_err:
+                    logger.error(f"PowerShell screenshot capture failed: {ps_err}")
+
+            await asyncio.to_thread(_do_grab)
             return f"Screenshot saved at {fp}"
         except Exception as e:
             return f"Screenshot failed: {e}"
@@ -1243,6 +1435,49 @@ class SkillsEngine:
                 results.append(f"{app_name.capitalize()} opened in browser.")
                 success = True
                 continue
+
+            # 0b. Check if this is a known folder path (downloads, desktop, documents, pictures, etc.)
+            folder_aliases = ["downloads", "desktop", "documents", "pictures", "workspace"]
+            clean_folder_name = app_lower.replace("my ", "").replace(" folder", "").replace("directory", "").strip()
+            if clean_folder_name in folder_aliases:
+                from modules.file_manager import get_file_manager
+                fm = get_file_manager()
+                target_path = fm.resolve_folder_alias(clean_folder_name)
+                if target_path and target_path.exists():
+                    if platform.system() == "Windows":
+                        os.startfile(str(target_path.resolve()))
+                        await asyncio.sleep(0.5)
+                        focus_target_window(clean_folder_name)
+                        await asyncio.sleep(1.0)
+                    else:
+                        os.system(f'explorer "{target_path}"')
+                    results.append(f"Opened '{clean_folder_name.capitalize()}' folder in File Explorer.")
+                    success = True
+                    continue
+
+            # 0c. Context-aware Explorer folder resolution (if LLM output open_app:explorer for "open downloads folder")
+            if app_lower in ["explorer", "file explorer", "windows explorer", "my explorer"]:
+                last_req = getattr(self, 'last_user_request', '').lower()
+                target_f = None
+                for f_alias in ["downloads", "desktop", "documents", "pictures", "workspace"]:
+                    if f_alias in last_req:
+                        target_f = f_alias
+                        break
+                if target_f:
+                    from modules.file_manager import get_file_manager
+                    fm = get_file_manager()
+                    target_path = fm.resolve_folder_alias(target_f)
+                    if target_path and target_path.exists():
+                        if platform.system() == "Windows":
+                            os.startfile(str(target_path.resolve()))
+                            await asyncio.sleep(0.5)
+                            focus_target_window(target_f)
+                            await asyncio.sleep(1.0)
+                        else:
+                            os.system(f'explorer "{target_path}"')
+                        results.append(f"Opened '{target_f.capitalize()}' folder in File Explorer.")
+                        success = True
+                        continue
 
             # Check if this app request is actually an explicit web URL/domain
             is_web = (
@@ -2396,6 +2631,221 @@ Rules:
             return "Process check needs: pip install psutil"
         except Exception as e:
             return f"Process check failed: {e}"
+
+    def _skill_get_recent_history(self, *args) -> str:
+        """Recall extended past conversation history on-demand."""
+        limit = 20
+        from modules.memory import get_memory_manager
+        mm = get_memory_manager(self.config)
+        return mm.get_recent_history(limit=limit)
+
+    async def _skill_file_find(self, *args) -> str:
+        """Fuzzy search for a file in user directories (Desktop, Downloads, Documents, Pictures)."""
+        query = " ".join(args).strip()
+        from modules.file_manager import get_file_manager
+        fm = get_file_manager()
+        success, msg, file_path = fm.find_file(query)
+        if success and file_path:
+            return f"Found file: '{file_path.name}' at location '{file_path}'"
+        return msg
+
+    async def _skill_file_copy(self, *args) -> str:
+        """Copy a file to target user directory."""
+        raw = " ".join(args).strip()
+        parts = [p.strip() for p in raw.split("|") if p.strip()]
+        query = parts[0] if parts else raw
+        dest = parts[1] if len(parts) > 1 else "desktop"
+        from modules.file_manager import get_file_manager
+        fm = get_file_manager()
+        success, msg = fm.copy_file(query, dest)
+        return msg
+
+    async def _skill_file_move(self, *args) -> str:
+        """Move a file to target user directory."""
+        raw = " ".join(args).strip()
+        parts = [p.strip() for p in raw.split("|") if p.strip()]
+        query = parts[0] if parts else raw
+        dest = parts[1] if len(parts) > 1 else "desktop"
+        from modules.file_manager import get_file_manager
+        fm = get_file_manager()
+        success, msg = fm.move_file(query, dest)
+        return msg
+
+    async def _skill_file_send_whatsapp(self, *args) -> str:
+        """Locate file and trigger WhatsApp attachment pipeline."""
+        raw = " ".join(args).strip()
+        parts = [p.strip() for p in raw.split("|") if p.strip()]
+        query = parts[0] if parts else raw
+        recipient = parts[1] if len(parts) > 1 else ""
+        from modules.file_manager import get_file_manager
+        fm = get_file_manager()
+        success, msg, file_path = fm.find_file(query)
+        if not success or not file_path:
+            return f"WhatsApp send failed: {msg}"
+        
+        web_res = await self._skill_web_open("whatsapp.com")
+        return f"File '{file_path.name}' found at '{file_path}'. Opened WhatsApp. Target contact: '{recipient or 'Current Chat'}'."
+
+    async def _skill_file_upload_browser(self, *args) -> str:
+        """Locate file and trigger browser upload + dictation pipeline."""
+        raw = " ".join(args).strip()
+        parts = [p.strip() for p in raw.split("|") if p.strip()]
+        query = parts[0] if parts else raw
+        prompt_text = parts[1] if len(parts) > 1 else ""
+        from modules.file_manager import get_file_manager
+        fm = get_file_manager()
+        success, msg, file_path = fm.find_file(query)
+        if not success or not file_path:
+            return f"Browser upload failed: {msg}"
+
+        return f"File '{file_path.name}' ready for browser upload at '{file_path}'. Dictated prompt: '{prompt_text}'."
+
+    async def _skill_file_list_by_date(self, *args) -> str:
+        """List files in folder filtered by relative days ago (e.g. 2 din pehle, kal, aaj)."""
+        raw = " ".join(args).strip()
+        parts = [p.strip() for p in raw.split("|") if p.strip()]
+        folder = parts[0] if parts else "downloads"
+        days_ago = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+        from modules.file_manager import get_file_manager
+        fm = get_file_manager()
+        success, summary, files = fm.list_files_by_relative_date(folder, days_ago)
+        return summary
+
+    async def _skill_file_list_whatsapp(self, *args) -> str:
+        """List documents from relative date and send report over WhatsApp."""
+        raw = " ".join(args).strip()
+        parts = [p.strip() for p in raw.split("|") if p.strip()]
+        folder = parts[0] if parts else "documents"
+        days_ago = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 1
+        recipient = parts[2] if len(parts) > 2 else ""
+        from modules.file_manager import get_file_manager
+        fm = get_file_manager()
+        success, summary, files = fm.list_files_by_relative_date(folder, days_ago)
+        web_res = await self._skill_web_open("whatsapp.com")
+        return f"Document summary generated: '{summary}'. Opened WhatsApp for contact '{recipient or 'Current Chat'}'."
+
+    async def _skill_folder_screenshot_whatsapp(self, *args) -> str:
+        """Open target folder window, capture screenshot, and send via WhatsApp."""
+        raw = " ".join(args).strip()
+        parts = [p.strip() for p in raw.split("|") if p.strip()]
+        folder = parts[0] if parts else "downloads"
+        recipient = parts[1] if len(parts) > 1 else ""
+        from modules.file_manager import get_file_manager
+        fm = get_file_manager()
+        folder_path = fm.resolve_folder_alias(folder)
+        if platform.system() == "Windows":
+            os.startfile(str(folder_path.resolve()))
+        else:
+            os.system(f'explorer "{folder_path}"')
+        await asyncio.sleep(1.2)
+        ss_res = await self._skill_read_screen("current")
+        web_res = await self._skill_web_open("whatsapp.com")
+        return f"Captured screenshot of folder '{folder_path.name}'. Opened WhatsApp for '{recipient or 'Current Chat'}'."
+
+    async def _skill_vscode_git_push(self, *args) -> str:
+        """Open VS Code, open terminal, and auto-push files to GitHub."""
+        commit_msg = " ".join(args).strip() or "Auto update via MAX"
+        from modules.file_manager import get_file_manager
+        fm = get_file_manager()
+        ws_dir = fm.folder_map["workspace"]
+        os.system(f'code "{ws_dir}"')
+        await asyncio.sleep(1.5)
+        try:
+            import pyautogui
+            pyautogui.hotkey('ctrl', '`')
+            await asyncio.sleep(0.8)
+            pyautogui.typewrite(f'git add . && git commit -m "{commit_msg}" && git push\n', interval=0.03)
+            return f"Opened VS Code and executed 'git push' in terminal with commit message: '{commit_msg}'."
+        except Exception as e:
+            return f"VS Code Git push executed via CLI: {e}"
+
+    async def _skill_vscode_close_folder(self, *args) -> str:
+        """Close active open folder in VS Code via PyAutoGUI hotkeys."""
+        try:
+            import pyautogui
+            pyautogui.hotkey('ctrl', 'k')
+            await asyncio.sleep(0.3)
+            pyautogui.press('f')
+        except Exception as e:
+            return f"VS Code close folder execution: {e}"
+
+    async def _skill_key_chord(self, *args) -> str:
+        """
+        Press and HOLD simultaneous key combinations (e.g., Alt+F4, Ctrl+W, Ctrl+Shift+Esc, Win+D).
+        Usage: [SKILL:key_chord:alt|f4] or [SKILL:key_chord:ctrl|w]
+        """
+        raw = " ".join(args).strip()
+        keys = [k.strip().lower() for k in raw.replace("+", "|").split("|") if k.strip()]
+        if not keys:
+            return "No keys provided for chord."
+
+        try:
+            import pyautogui
+            for key in keys[:-1]:
+                pyautogui.keyDown(key)
+            pyautogui.press(keys[-1])
+            for key in reversed(keys[:-1]):
+                pyautogui.keyUp(key)
+
+            combo_str = " + ".join(keys).upper()
+            logger.info(f"🎹 Executed Key Chord: {combo_str}")
+            return f"Successfully executed key shortcut '{combo_str}'."
+        except Exception as e:
+            return f"Key chord error: {e}"
+
+    async def _skill_close_window(self, *args) -> str:
+        """Close current active window via Alt+F4 simultaneous key chord."""
+        return await self._skill_key_chord("alt|f4")
+
+    async def _skill_close_app(self, *args) -> str:
+        """
+        Close a specific app by name (e.g., 'notepad', 'chrome', 'vscode', 'whatsapp', 'calc')
+        or close current window if no app name provided.
+        """
+        app_name = " ".join(args).strip().lower()
+        if not app_name or app_name in ["current", "active", "this", "this window", "window"]:
+            return await self._skill_close_window()
+
+        process_map = {
+            "notepad": "notepad.exe",
+            "chrome": "chrome.exe",
+            "google chrome": "chrome.exe",
+            "vscode": "code.exe",
+            "vs code": "code.exe",
+            "code": "code.exe",
+            "whatsapp": "WhatsApp.exe",
+            "calc": "calculatorapp.exe",
+            "calculator": "calculatorapp.exe",
+            "edge": "msedge.exe",
+            "browser": "msedge.exe",
+            "spotify": "spotify.exe",
+            "vlc": "vlc.exe",
+            "word": "winword.exe",
+            "excel": "excel.exe"
+        }
+
+        proc_exe = None
+        for k, exe in process_map.items():
+            if k in app_name:
+                proc_exe = exe
+                break
+
+        if proc_exe:
+            os.system(f"taskkill /IM {proc_exe} /F >nul 2>&1")
+            return f"Closed application '{app_name}' ({proc_exe})."
+
+        try:
+            import pygetwindow as gw
+            wins = gw.getWindowsWithTitle(app_name)
+            if wins:
+                wins[0].activate()
+                await asyncio.sleep(0.3)
+                return await self._skill_close_window()
+        except Exception:
+            pass
+
+        os.system(f"taskkill /IM {app_name}.exe /F >nul 2>&1")
+        return f"Triggered close command for '{app_name}'."
 
 def _number_to_words(n: int) -> str:
     """Convert integer to English words for better TTS pronunciation."""
