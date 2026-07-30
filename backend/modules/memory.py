@@ -331,6 +331,221 @@ class MemoryManager:
             logger.error(f"Personality update failed: {e}")
             return False
 
+    # ═══════════════════════════════════════════════════
+    # MULTI-TIER MEMORY — Smart Context Retrieval
+    # ═══════════════════════════════════════════════════
+
+    def get_context_for_query(self, query: str, intent_type: str = "COMMAND") -> str:
+        """
+        Smart memory retriever — returns ONLY the memory relevant for this query type.
+        
+        Token-efficient context injection:
+          CONVERSATION → short-term turns + user facts + personality (~50 tokens)
+          COMMAND      → short-term turns only (~30 tokens)  
+          MEMORY_RECALL → episodic search through past conversations (~100 tokens)
+        """
+        context_parts = []
+        query_lower = query.lower()
+
+        # ── Check if this is a memory recall query ──
+        memory_recall_signals = [
+            "remember", "pehle", "yesterday", "earlier", "last time",
+            "what did we", "kya baat ki", "yaad", "recall", "history",
+            "discussed", "past conversation"
+        ]
+        is_recall = any(s in query_lower for s in memory_recall_signals)
+
+        if is_recall:
+            # Episodic recall — search past conversations
+            episodes = self._search_episodes(query, top_k=3)
+            if episodes:
+                context_parts.append("PAST CONVERSATIONS:\n" + episodes)
+            # Also include factual context for continuity
+            facts_ctx = self._get_factual_context()
+            if facts_ctx:
+                context_parts.append(facts_ctx)
+            return "\n".join(context_parts)
+
+        # ── Permanent Rules (always inject) ──
+        rules_ctx = self._get_rules_context()
+        if rules_ctx:
+            context_parts.append(rules_ctx)
+
+        if intent_type in ("CONVERSATION", "CAPABILITY_QUESTION"):
+            # Chat: user facts + personality + short-term
+            facts_ctx = self._get_factual_context()
+            if facts_ctx:
+                context_parts.append(facts_ctx)
+            personality_ctx = self._get_personality_context()
+            if personality_ctx:
+                context_parts.append(personality_ctx)
+            # Short-term (last 4 messages for chat continuity)
+            short_term = self._get_short_term(limit=4)
+            if short_term:
+                context_parts.append(short_term)
+
+        elif intent_type in ("COMMAND", "INFORMATION_QUESTION"):
+            # Action: just short-term for pronoun resolution
+            short_term = self._get_short_term(limit=3)
+            if short_term:
+                context_parts.append(short_term)
+
+        else:
+            # Fallback: standard context (original behavior)
+            return self.get_context()
+
+        return "\n".join(context_parts) if context_parts else "None"
+
+    def _get_rules_context(self) -> str:
+        """Get permanent rules (compact)."""
+        rules_file = self.memory_file.parent / "permanent_rules.json"
+        if not rules_file.exists():
+            return ""
+        try:
+            rules = json.loads(rules_file.read_text(encoding='utf-8'))
+            if rules:
+                return "RULES: " + "; ".join(r['rule'][:60] for r in rules[:5])
+        except Exception:
+            pass
+        return ""
+
+    def _get_factual_context(self) -> str:
+        """Get user facts (compact)."""
+        facts = self.memory.get("user_facts", {})
+        if not facts:
+            return ""
+        parts = []
+        for k, v in facts.items():
+            if k != "preferences" and v:
+                parts.append(f"{k}: {v}")
+        return "USER: " + ", ".join(parts) if parts else ""
+
+    def _get_personality_context(self) -> str:
+        """Get personality profile (compact)."""
+        profile = self.memory.get("personality_profile", {})
+        if not profile:
+            return ""
+        parts = []
+        if profile.get("prefers_short_answers"):
+            parts.append("prefers short answers")
+        domain = profile.get("main_domain")
+        if domain:
+            parts.append(f"domain: {domain}")
+        return "PROFILE: " + ", ".join(parts) if parts else ""
+
+    def _get_short_term(self, limit: int = 4) -> str:
+        """Get last N messages (compact)."""
+        messages = self.memory.get("messages", [])
+        if not messages:
+            return ""
+        recent = messages[-limit:]
+        lines = []
+        for m in recent:
+            role = "You" if m["role"] == "user" else "Max"
+            content = m["content"][:120]
+            lines.append(f"{role}: {content}")
+        return "\n".join(lines)
+
+    # ── Episodic Memory ──────────────────────────────────
+
+    def _get_episodes_file(self) -> Path:
+        """Path to episodic memory JSON file."""
+        return self.memory_file.parent / "episodic_memory.json"
+
+    async def store_episode(self, user_text: str, max_response: str, skill_used: str = ""):
+        """
+        Store an interaction as an episodic memory entry.
+        Called after every meaningful interaction.
+        """
+        try:
+            episodes_file = self._get_episodes_file()
+            episodes = []
+            if episodes_file.exists():
+                try:
+                    episodes = json.loads(episodes_file.read_text(encoding='utf-8'))
+                except Exception:
+                    episodes = []
+
+            episode = {
+                "timestamp": datetime.now().isoformat(),
+                "user": user_text[:200],
+                "max": max_response[:200],
+                "skill": skill_used or "",
+                "hour": datetime.now().hour
+            }
+            episodes.append(episode)
+
+            # Keep last 200 episodes (prevent unbounded growth)
+            if len(episodes) > 200:
+                episodes = episodes[-200:]
+
+            episodes_file.parent.mkdir(parents=True, exist_ok=True)
+            episodes_file.write_text(
+                json.dumps(episodes, indent=1, ensure_ascii=False),
+                encoding='utf-8'
+            )
+        except Exception as e:
+            logger.warning(f"Failed to store episode: {e}")
+
+    def _search_episodes(self, query: str, top_k: int = 3) -> str:
+        """
+        Search episodic memory for relevant past interactions.
+        Uses simple keyword overlap scoring (fast, no ML dependency).
+        """
+        episodes_file = self._get_episodes_file()
+        if not episodes_file.exists():
+            return ""
+
+        try:
+            episodes = json.loads(episodes_file.read_text(encoding='utf-8'))
+        except Exception:
+            return ""
+
+        if not episodes:
+            return ""
+
+        import re
+        query_words = set(re.findall(r'\b\w+\b', query.lower()))
+        # Remove common stop words
+        stop_words = {"the", "a", "is", "was", "i", "you", "me", "my", "we", "did",
+                      "what", "kya", "hai", "ki", "ka", "se", "ko", "ne", "thi", "tha"}
+        query_words -= stop_words
+
+        if not query_words:
+            # No meaningful words — return last few episodes
+            recent = episodes[-top_k:]
+            return self._format_episodes(recent)
+
+        scored = []
+        for ep in episodes:
+            text = (ep.get("user", "") + " " + ep.get("max", "")).lower()
+            ep_words = set(re.findall(r'\b\w+\b', text))
+            overlap = len(query_words & ep_words)
+            if overlap > 0:
+                scored.append((overlap, ep))
+
+        if not scored:
+            # No keyword matches — return most recent episodes
+            return self._format_episodes(episodes[-top_k:])
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        top = [ep for _, ep in scored[:top_k]]
+        return self._format_episodes(top)
+
+    def _format_episodes(self, episodes: list) -> str:
+        """Format episodes for LLM context injection."""
+        if not episodes:
+            return ""
+        lines = []
+        for ep in episodes:
+            ts = ep.get("timestamp", "")[:16]  # YYYY-MM-DDTHH:MM
+            user_text = ep.get("user", "")[:80]
+            max_text = ep.get("max", "")[:80]
+            skill = ep.get("skill", "")
+            skill_tag = f" [{skill}]" if skill else ""
+            lines.append(f"[{ts}] You: {user_text} → Max: {max_text}{skill_tag}")
+        return "\n".join(lines)
+
 
 _memory_instance: Optional[MemoryManager] = None
 
@@ -343,3 +558,4 @@ def get_memory_manager(config) -> MemoryManager:
             summarize_threshold=config.MEMORY_SUMMARIZE_THRESHOLD
         )
     return _memory_instance
+
