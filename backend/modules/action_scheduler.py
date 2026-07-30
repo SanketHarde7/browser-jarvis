@@ -23,27 +23,28 @@ class ActionScheduler:
             self.tasks_file.write_text("[]", encoding="utf-8")
 
     def add_task(self, execute_at: str, skill_name: str, params: list) -> str:
-        """Saves a new task to the JSON queue."""
+        """Saves a new task to the JSON queue, auto-parsing natural dates."""
         try:
-            # Format check
-            datetime.strptime(execute_at, "%Y-%m-%d %H:%M")
-        except ValueError:
-            return "Task failed: Invalid date format. Must be YYYY-MM-DD HH:MM."
+            from modules.date_utils import parse_natural_datetime
+            date_part, time_part = parse_natural_datetime(execute_at, "")
+            execute_at_clean = f"{date_part} {time_part}"
+        except Exception:
+            execute_at_clean = datetime.now().strftime("%Y-%m-%d %H:%M")
 
         tasks = json.loads(self.tasks_file.read_text(encoding="utf-8"))
         task_id = f"task_{int(time.time())}"
         
         tasks.append({
             "id": task_id,
-            "execute_at": execute_at,
+            "execute_at": execute_at_clean,
             "skill_name": skill_name,
             "params": params,
             "status": "pending"
         })
         
         self.tasks_file.write_text(json.dumps(tasks, indent=4), encoding="utf-8")
-        logger.info(f"Task Scheduled 📅: [{skill_name}] for {execute_at}")
-        return f"Done Sir! I have scheduled the {skill_name} task for {execute_at}."
+        logger.info(f"Task Scheduled 📅: [{skill_name}] for {execute_at_clean}")
+        return f"Done! Scheduled {skill_name} task for {execute_at_clean}."
 
     def start(self):
         """Starts the background loop if not already running."""
