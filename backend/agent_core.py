@@ -63,6 +63,8 @@ from modules.gatekeeper import get_gatekeeper
 from modules.Intent_engine import get_intent_engine
 from modules.listening_manager import ListeningManager
 from modules.agent_loop import get_agent_loop, is_complex_goal
+from modules.skill_rag import get_skill_rag
+from modules.learning_engine import get_learning_engine
 from modules.orchestrator import (
     DIRECT, NEEDS_APPROVAL, approval_reply_kind, cancel_task, classify_complexity,
     get_status_summary, pop_pending_approval, remember_pending_approval, start_orchestrator_background,
@@ -552,13 +554,51 @@ class MaxAgent:
                 except Exception:
                     pass
 
-            result = await get_response(text, combined_context, allow_skills=allow_skills)
+            # ── Smart Memory: Intent-aware context retrieval ──
+            try:
+                smart_context = self.memory.get_context_for_query(text, intent.type.value)
+                combined_context = kb_prefix + smart_context if kb_prefix else smart_context
+            except Exception as e:
+                logger.warning(f"Smart memory failed, using standard: {e}")
+
+            # ── Skill RAG: Select only relevant candidate skills ──
+            candidate_skills_block = ""
+            if allow_skills:
+                try:
+                    skill_rag = get_skill_rag()
+                    candidates = skill_rag.match(text, top_k=5)
+                    candidate_skills_block = skill_rag.format_for_prompt(candidates)
+                    print(f" [TRACKER: 8.1] SkillRAG matched: {[c.name for c in candidates]}")
+                except Exception as e:
+                    logger.warning(f"SkillRAG failed, using empty: {e}")
+
+            # ── Learning Engine: Get learning context ──
+            learning_context = ""
+            try:
+                learning_engine = get_learning_engine()
+                learning_context = learning_engine.get_learning_context()
+                # Detect feedback on previous interaction
+                feedback = learning_engine.detect_feedback(text)
+                if feedback:
+                    learning_engine.process_feedback(text, feedback)
+                    print(f" [TRACKER: 8.2] Learning feedback detected: {feedback}")
+            except Exception as e:
+                logger.warning(f"LearningEngine failed: {e}")
+
+            result = await get_response(
+                text, combined_context, allow_skills=allow_skills,
+                candidate_skills_block=candidate_skills_block,
+                learning_context=learning_context
+            )
             llm_response = result["response"]
             skill_tag = result.get("skill") if allow_skills else None
             print(f" [TRACKER: 9] LLM Replied. Skill: {skill_tag}")
 
-            if allow_skills and not skill_tag:
-                skill_tag = _force_open_app_skill(text)
+            # Record interaction for learning
+            try:
+                get_learning_engine().record_interaction(text, llm_response, skill_tag)
+            except Exception:
+                pass
 
             final_response = llm_response
             if skill_tag:
@@ -600,6 +640,12 @@ class MaxAgent:
 
             await self.memory.add_message("assistant", filtered)
             await self.memory.save_memory()
+
+            # ── Store episodic memory for future recall ──
+            try:
+                await self.memory.store_episode(text, filtered, skill_tag or "")
+            except Exception:
+                pass
 
             tts_path = ""
             if use_tts and filtered:
