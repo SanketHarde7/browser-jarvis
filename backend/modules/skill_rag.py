@@ -148,7 +148,8 @@ SKILL_METADATA: Dict[str, Dict] = {
     "search": {
         "triggers": ["search", "google", "find", "lookup", "dhundho", "search for",
                       "kya hai", "who is", "what is", "latest", "news", "score",
-                      "price", "weather"],
+                      "price", "weather", "what's going on", "what is happening",
+                      "tell me about", "going on in", "current news", "events in"],
         "desc": "Web search for information",
         "example": "[SKILL:search:latest AI news]",
         "cat": "web"
