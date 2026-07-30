@@ -249,8 +249,8 @@ class MemoryManager:
 
     async def extract_and_store_facts(self, user_text: str) -> List[str]:
         """
-        Simple pattern-based fact extraction.
-        e.g. 'Mera naam the user hai' -> name=the user
+        Pattern-based + Gemini Flash Lite intelligent fact extraction.
+        e.g. 'Mera naam Sanket hai' -> name=Sanket
         """
         import re
         facts_found = []
@@ -302,6 +302,18 @@ class MemoryManager:
                 await self.update_user_fact("preferences", prefs)
                 facts_found.append(f"{category}={item}")
         
+        # If pattern matching found nothing and text has enough substance, try Gemini Router
+        if not facts_found and len(user_text.strip()) > 15:
+            try:
+                from modules.gemini_router import get_gemini_router
+                gemini_facts = await get_gemini_router().extract_facts(user_text)
+                for k, v in gemini_facts.items():
+                    if k and v and isinstance(v, str):
+                        await self.update_user_fact(k, v)
+                        facts_found.append(f"{k}={v}")
+            except Exception as e:
+                logger.debug(f"Gemini fact extraction skipped: {e}")
+
         return facts_found
     
     async def update_personality(self, response_length: int, skill_used: str = "") -> bool:
