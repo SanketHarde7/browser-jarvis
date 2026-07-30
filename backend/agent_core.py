@@ -265,9 +265,13 @@ class MaxAgent:
             admin_secret = os.getenv("MAX_ADMIN_ELEVATION_PASSPHRASE", "").strip()
             if admin_secret and len(admin_secret) >= 8:
                 import hmac
-                # Check for exact token match or exact secret phrase match in prompt
+                def _safe_digest_check(val1: str, val2: str) -> bool:
+                    try:
+                        return hmac.compare_digest(val1.encode('utf-8'), val2.encode('utf-8'))
+                    except Exception:
+                        return False
                 words = text_lower.split()
-                if any(hmac.compare_digest(w, admin_secret.lower()) for w in words) or hmac.compare_digest(text_lower, admin_secret.lower()):
+                if any(_safe_digest_check(w, admin_secret.lower()) for w in words) or _safe_digest_check(text_lower, admin_secret.lower()):
                     from modules.device_security import get_security_manager
                     sec = get_security_manager(self.config)
                     active_dev = get_active_device()
