@@ -1761,131 +1761,177 @@ class SkillsEngine:
         from modules.media_engine import media_engine
         return await media_engine.play_media(query)
         
-    def _skill_whatsapp_message(self, contact: str = "", message: str = "", **kw) -> str:
-        if not PYAUTOGUI_AVAILABLE: 
-            return "Typing needs: pip install pyautogui"
-        if not contact: 
-            return "Provide a contact name or number."
-        if not message: 
-            return "What message should I send?"
-            
+    def _resolve_contact_number(self, contact: str) -> Tuple[Optional[str], Optional[str]]:
+        """
+        Resolves contact input (name or number) to a validated phone number.
+        Returns (phone_number, error_message).
+        """
+        if not contact:
+            return None, "Please provide a contact name or phone number."
+
         contact_clean = contact.strip().lower()
         
-        # Check if the input is a direct phone number (contains digits)
+        # 1. Check if input is user's own number alias ("me", "myself", "mera", "my whatsapp", "my number", "sanket")
+        user_self_aliases = {"me", "myself", "mera", "my whatsapp", "my number", "mera number", "sanket", "self"}
+        if contact_clean in user_self_aliases:
+            my_num = getattr(self.config, "MY_WHATSAPP_NUMBER", "").strip() or os.getenv("MY_WHATSAPP_NUMBER", "").strip()
+            
+            if not my_num:
+                try:
+                    mem_file = Path(self.config.MEMORY_FILE)
+                    if mem_file.exists():
+                        mem_data = json.loads(mem_file.read_text(encoding='utf-8'))
+                        my_num = mem_data.get("user_facts", {}).get("whatsapp_number", "") or mem_data.get("user_facts", {}).get("phone", "")
+                except Exception:
+                    pass
+                    
+            if not my_num:
+                contacts_file = Path(self.config.DATA_DIR) / "contacts.json"
+                if contacts_file.exists():
+                    try:
+                        c_dict = json.loads(contacts_file.read_text(encoding='utf-8'))
+                        my_num = c_dict.get("me") or c_dict.get("sanket") or c_dict.get("myself")
+                    except Exception:
+                        pass
+
+            if my_num:
+                contact_clean = my_num.lower()
+            else:
+                return None, ("I don't have your WhatsApp number saved yet. "
+                              "You can add MY_WHATSAPP_NUMBER=+91XXXXXXXXXX in your .env file, "
+                              "or tell me 'My WhatsApp number is +91XXXXXXXXXX'.")
+
+        # 2. Check if the input is a direct phone number (digits)
         is_number = bool(re.match(r'^[\+\d\s\-]+$', contact_clean))
         
         if not is_number:
-            # It's a name! Let's look it up in contacts.json
             contacts_file = Path(self.config.DATA_DIR) / "contacts.json"
-            
             if contacts_file.exists():
                 try:
-                    contacts_dict = json.loads(contacts_file.read_text(encoding='utf-8'))
-                    # Dictionary lookup (case-insensitive)
-                    resolved_number = contacts_dict.get(contact_clean)
+                    c_dict = json.loads(contacts_file.read_text(encoding='utf-8'))
+                    matched_number = None
+                    for k, v in c_dict.items():
+                        if k.lower().strip() == contact_clean:
+                            matched_number = v
+                            break
                     
-                    if resolved_number:
-                        contact = resolved_number
+                    if matched_number:
+                        contact_clean = matched_number
                     else:
-                        return f"Sir, I don't have '{contact.title()}' saved in my contacts. Please update the contacts file."
+                        return None, f"I don't have '{contact.title()}' saved in your contacts.json file yet. Please add '{contact.title()}'s number to backend/data/contacts.json."
                 except Exception as e:
-                    logger.error(f"Failed to read contacts JSON: {e}")
-                    return "There is an error in reading the contacts file."
+                    return None, f"Error reading contacts file: {e}"
             else:
-                # Create a template file if it doesn't exist
-                template = {
-                    "aditya": "+919022306582",
-                    "papa": "+919022306582",
-                    "me": "+919022306582"
-                }
-                contacts_file.write_text(json.dumps(template, indent=4), encoding='utf-8')
-                return f"Sir, the contacts file was missing so I created one. Please add '{contact.title()}'s number to it."
+                return None, f"Contacts file missing. Please create backend/data/contacts.json and add '{contact.title()}'s number."
 
-        # Cleanup the number format before sending
-        contact = contact.replace(" ", "").replace("-", "")
-        if not contact.startswith("+"): 
-            # Defaulting to India (+91) if user just says a 10-digit number
-            contact = "+91" + contact 
-            
+        num = contact_clean.replace(" ", "").replace("-", "")
+        if not num.startswith("+"):
+            num = "+91" + num
+
+        return num, None
+
+    def _verify_whatsapp_network(self) -> bool:
+        """Quick socket check to verify network reachability before WhatsApp Web operations."""
+        import socket
         try:
-            logger.info(f"Sending WhatsApp message to {contact}...")
-            
+            sock = socket.create_connection(("web.whatsapp.com", 443), timeout=2.5)
+            sock.close()
+            return True
+        except Exception:
+            try:
+                sock = socket.create_connection(("1.1.1.1", 53), timeout=2.5)
+                sock.close()
+                return True
+            except Exception:
+                return False
+
+    def _skill_whatsapp_message(self, contact: str = "", message: str = "", **kw) -> str:
+        if not PYAUTOGUI_AVAILABLE: 
+            return "Typing needs: pip install pyautogui"
+        if not message: 
+            return "What message should I send?"
+
+        # 1. Resolve contact number (no hardcoded fake defaults!)
+        phone_num, err = self._resolve_contact_number(contact)
+        if err:
+            return err
+
+        # 2. Network connectivity pre-check (Prevents claiming success when offline/slow)
+        if not self._verify_whatsapp_network():
+            return "❌ Low network speed or offline: Cannot connect to WhatsApp Web right now. Please check your internet connection and try again."
+
+        try:
+            logger.info(f"Sending WhatsApp message to {phone_num}...")
             import webbrowser
             from urllib.parse import quote
-            
-            url = f"https://web.whatsapp.com/send?phone={contact}&text={quote(message)}"
+            import pyautogui
+
+            url = f"https://web.whatsapp.com/send?phone={phone_num}&text={quote(message)}"
             logger.info(f"Opening browser: {url}")
             webbrowser.open(url)
+
+            # 3. Dynamic page load verification (Checking window focus & network status up to 18s)
+            max_wait = 18
+            loaded = False
+            start_time = time.time()
             
-            # Wait for WhatsApp Web page to load (default 15 seconds)
-            wait_time = 15
-            logger.info(f"Waiting {wait_time} seconds for page to load...")
-            time.sleep(wait_time)
-            
-            # Try focusing browser/whatsapp window
-            try:
-                import pygetwindow as gw
-                windows = [w for w in gw.getAllWindows() if "whatsapp" in w.title.lower()]
-                if not windows:
-                    browser_keywords = ["chrome", "edge", "opera", "firefox", "brave", "browser"]
-                    windows = [w for w in gw.getAllWindows() if any(kw in w.title.lower() for kw in browser_keywords)]
-                if windows:
-                    logger.info(f"Bringing window to focus: {windows[0].title}")
-                    windows[0].activate()
-                    time.sleep(0.5)
-            except Exception as win_err:
-                logger.warning(f"Could not focus browser window: {win_err}")
+            while time.time() - start_time < max_wait:
+                time.sleep(1.5)
+                if not self._verify_whatsapp_network():
+                    return "⚠️ Message delivery unconfirmed: Network connection dropped while loading WhatsApp Web. Please check your browser."
                 
-            # Press enter to send the message
-            import pyautogui
+                try:
+                    import pygetwindow as gw
+                    windows = [w for w in gw.getAllWindows() if "whatsapp" in w.title.lower() or any(b in w.title.lower() for b in ["chrome", "edge", "opera", "firefox", "brave"])]
+                    if windows:
+                        try:
+                            windows[0].activate()
+                        except Exception:
+                            pass
+                        loaded = True
+                        time.sleep(3.0)
+                        break
+                except Exception:
+                    pass
+
+            if not loaded:
+                return f"⚠️ Low network speed: WhatsApp Web page load timed out ({max_wait}s). Message delivery could not be confirmed."
+
+            # 4. Perform typing & sending
             logger.info("Pressing Enter to send message...")
             pyautogui.press("enter")
             
-            # Wait a few seconds before closing to let message send (increased from 3 to 5 seconds)
-            close_time = 5
-            logger.info(f"Waiting {close_time} seconds for transmission...")
-            time.sleep(close_time)
-            
-            logger.info("Closing WhatsApp Web tab...")
+            # Post-send verification wait
+            time.sleep(4.0)
+            if not self._verify_whatsapp_network():
+                return f"⚠️ Network slowed down during transmission. Message submitted to browser tab, but final delivery verification timed out. Please check your browser."
+
+            # Close tab cleanly
             pyautogui.hotkey("ctrl", "w")
             
-            return f"WhatsApp message successfully sent to {contact_clean.title()}."
+            contact_label = contact.title() if contact else phone_num
+            return f"✅ WhatsApp message successfully sent to {contact_label} ({phone_num})."
+
         except Exception as e:
-            return f"WhatsApp failed: {e}"
+            return f"❌ WhatsApp execution error: {e}"
 
     def _skill_whatsapp_screenshot(self, contact: str = "", **kw) -> str:
         if not PYAUTOGUI_AVAILABLE: 
             return "Typing needs: pip install pyautogui"
-        if not contact: 
-            return "Provide a contact name or number."
             
-        contact_clean = contact.strip().lower()
-        is_number = bool(re.match(r'^[\+\d\s\-]+$', contact_clean))
-        
-        if not is_number:
-            contacts_file = Path(self.config.DATA_DIR) / "contacts.json"
-            if contacts_file.exists():
-                try:
-                    contacts_dict = json.loads(contacts_file.read_text(encoding='utf-8'))
-                    resolved_number = contacts_dict.get(contact_clean)
-                    if resolved_number:
-                        contact = resolved_number
-                    else:
-                        return f"Sir, I don't have '{contact.title()}' saved in my contacts."
-                except Exception as e:
-                    logger.error(f"Failed to read contacts JSON: {e}")
-                    return "There is an error in reading the contacts file."
-            else:
-                return "Contacts file missing."
+        phone_num, err = self._resolve_contact_number(contact)
+        if err:
+            return err
 
-        contact = contact.replace(" ", "").replace("-", "")
-        if not contact.startswith("+"): 
-            contact = "+91" + contact 
-            
+        if not self._verify_whatsapp_network():
+            return "❌ Low network speed or offline: Cannot connect to WhatsApp Web right now."
+
         try:
-            logger.info(f"Taking screenshot for WhatsApp to {contact}...")
+            logger.info(f"Taking screenshot for WhatsApp to {phone_num}...")
             from PIL import ImageGrab
             import subprocess
+            import pyautogui
+
             ss_dir = Path(self.config.DATA_DIR) / "screenshots"
             ss_dir.mkdir(parents=True, exist_ok=True)
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1896,38 +1942,45 @@ class SkillsEngine:
             subprocess.run(["powershell", "-command", ps_cmd])
             
             import webbrowser
-            url = f"https://web.whatsapp.com/send?phone={contact}"
-            logger.info(f"Opening browser: {url}")
+            url = f"https://web.whatsapp.com/send?phone={phone_num}"
             webbrowser.open(url)
             
-            time.sleep(15)
+            max_wait = 18
+            loaded = False
+            start_time = time.time()
             
-            try:
-                import pygetwindow as gw
-                windows = [w for w in gw.getAllWindows() if "whatsapp" in w.title.lower()]
-                if not windows:
-                    browser_keywords = ["chrome", "edge", "opera", "firefox", "brave", "browser"]
-                    windows = [w for w in gw.getAllWindows() if any(kw in w.title.lower() for kw in browser_keywords)]
-                if windows:
-                    windows[0].activate()
-                    time.sleep(0.5)
-            except Exception as win_err:
-                pass
+            while time.time() - start_time < max_wait:
+                time.sleep(1.5)
+                if not self._verify_whatsapp_network():
+                    return "⚠️ Screenshot delivery unconfirmed: Network dropped while loading WhatsApp Web."
                 
-            import pyautogui
-            logger.info("Pasting image...")
+                try:
+                    import pygetwindow as gw
+                    windows = [w for w in gw.getAllWindows() if "whatsapp" in w.title.lower() or any(b in w.title.lower() for b in ["chrome", "edge", "opera", "firefox", "brave"])]
+                    if windows:
+                        try:
+                            windows[0].activate()
+                        except Exception:
+                            pass
+                        loaded = True
+                        time.sleep(3.0)
+                        break
+                except Exception:
+                    pass
+
+            if not loaded:
+                return f"⚠️ Low network speed: WhatsApp Web page load timed out ({max_wait}s)."
+
             pyautogui.hotkey("ctrl", "v")
-            time.sleep(2)
-            logger.info("Pressing Enter to send message...")
+            time.sleep(2.0)
             pyautogui.press("enter")
-            
-            time.sleep(5)
-            logger.info("Closing WhatsApp Web tab...")
+            time.sleep(4.0)
             pyautogui.hotkey("ctrl", "w")
             
-            return f"Screenshot successfully sent to {contact_clean.title()} on WhatsApp."
+            contact_label = contact.title() if contact else phone_num
+            return f"✅ Screenshot successfully sent to {contact_label} ({phone_num}) on WhatsApp."
         except Exception as e:
-            return f"WhatsApp screenshot failed: {e}"
+            return f"❌ WhatsApp screenshot failed: {e}"
 
     def _skill_type_text(self, *args) -> str:
         if not PYAUTOGUI_AVAILABLE: 
