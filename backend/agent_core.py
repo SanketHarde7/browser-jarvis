@@ -594,12 +594,6 @@ class MaxAgent:
             skill_tag = result.get("skill") if allow_skills else None
             print(f" [TRACKER: 9] LLM Replied. Skill: {skill_tag}")
 
-            # Record interaction for learning
-            try:
-                get_learning_engine().record_interaction(text, llm_response, skill_tag)
-            except Exception:
-                pass
-
             final_response = llm_response
             if skill_tag:
                 print(f" [TRACKER: 10] Executing Skill: {skill_tag}")
@@ -641,8 +635,9 @@ class MaxAgent:
             await self.memory.add_message("assistant", filtered)
             await self.memory.save_memory()
 
-            # ── Store episodic memory for future recall ──
+            # ── Store learning interaction & episodic memory for future recall ──
             try:
+                get_learning_engine().record_interaction(text, filtered, skill_tag or "")
                 await self.memory.store_episode(text, filtered, skill_tag or "")
             except Exception:
                 pass
