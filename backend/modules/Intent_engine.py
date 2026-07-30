@@ -177,16 +177,24 @@ def _fast_classify(text: str) -> Optional[Intent]:
     Dynamically differentiates capability questions from explicit action requests.
     """
     t = text.strip()
-    words = set(re.findall(r'\b\w+\b', t.lower()))
+    # Strip wake word for cleaner pattern matching
+    t_clean = re.sub(r'^(hey max|hello max|hi max|ok max|max)[\s,]*', '', t, flags=re.IGNORECASE).strip()
+    words = set(re.findall(r'\b\w+\b', t_clean.lower()))
 
-    # If user uses capability phrasing BUT specifies an explicit action verb ("Can you open google?"), it's a COMMAND!
-    if _CAPABILITY_PATTERNS.search(t):
-        if words.intersection(_ACTION_VERBS) and not _NEGATIVE_PATTERNS.search(t):
+    # Capability check:
+    # "can you play youtube videos?" -> CAPABILITY_QUESTION
+    # "can you play Believer on youtube?" -> COMMAND (has specific target 'believer')
+    if _CAPABILITY_PATTERNS.search(t_clean):
+        # Generic capability questions end with general terms ("videos", "music", "apps", "files", "code", "timers")
+        generic_terms = {"videos", "video", "music", "songs", "apps", "app", "files", "timers", "reminders", "code"}
+        is_generic = bool(words.intersection(generic_terms)) and len(words) <= 6
+        
+        if words.intersection(_ACTION_VERBS) and not is_generic and not _NEGATIVE_PATTERNS.search(t_clean):
             return Intent(
                 type=IntentType.COMMAND,
                 should_execute_skill=True,
                 confidence=0.98,
-                reason="capability phrasing with explicit action verb"
+                reason="capability phrasing with specific target action"
             )
         return Intent(
             type=IntentType.CAPABILITY_QUESTION,
@@ -195,7 +203,7 @@ def _fast_classify(text: str) -> Optional[Intent]:
             reason="pure capability question"
         )
 
-    if _NEGATIVE_PATTERNS.search(t):
+    if _NEGATIVE_PATTERNS.search(t_clean):
         return Intent(
             type=IntentType.NEGATIVE_COMMAND,
             should_execute_skill=False,
@@ -203,7 +211,7 @@ def _fast_classify(text: str) -> Optional[Intent]:
             reason="negation keyword detected"
         )
 
-    if _CONVERSATION_PATTERNS.match(t):
+    if _CONVERSATION_PATTERNS.match(t_clean) or _CONVERSATION_PATTERNS.match(t):
         return Intent(
             type=IntentType.CONVERSATION,
             should_execute_skill=False,
