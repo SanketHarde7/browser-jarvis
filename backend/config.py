@@ -115,6 +115,7 @@ class Config:
     MEMORY_FILE: str = str(DATA_DIR / "memory.json")
     MEMORY_MAX_MESSAGES: int = int(os.getenv("MEMORY_MAX_MESSAGES", "80"))
     MEMORY_SUMMARIZE_THRESHOLD: int = int(os.getenv("MEMORY_SUMMARIZE_THRESHOLD", "80"))
+    MY_WHATSAPP_NUMBER: str = os.getenv("MY_WHATSAPP_NUMBER", "").strip() or os.getenv("USER_WHATSAPP_NUMBER", "").strip()
 
     # ── File Handling ──
     MAX_FILE_SIZE_KB: int = int(os.getenv("MAX_FILE_SIZE_KB", "5000"))
