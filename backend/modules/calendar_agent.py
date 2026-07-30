@@ -58,21 +58,23 @@ class CalendarAgent:
             lines.append(f"  {e.get('date', '?')} {e.get('time', '?')} — {e.get('title', 'No title')}")
         return "\n".join(lines)
 
-    def add_event(self, title: str, date_str: str, time_str: str = "") -> str:
+    def add_event(self, title: str, date_str: str = "", time_str: str = "") -> str:
         try:
-            # Validate date
-            datetime.strptime(date_str, "%Y-%m-%d")
-        except ValueError:
-            return f"Date format sahi nahi hai boss. Use: YYYY-MM-DD (jaise 2026-05-04)"
+            from modules.date_utils import parse_natural_datetime
+            parsed_date, parsed_time = parse_natural_datetime(date_str, time_str)
+        except Exception:
+            parsed_date = datetime.now().strftime("%Y-%m-%d")
+            parsed_time = "09:00"
+
         events = _load_events()
         events.append({
-            "title": title,
-            "date": date_str,
-            "time": time_str or "00:00",
+            "title": title or "Event",
+            "date": parsed_date,
+            "time": parsed_time,
             "created": datetime.now().isoformat(),
         })
         _save_events(events)
-        return f"Event add ho gayi boss — '{title}' on {date_str}."
+        return f"Event added: '{title or 'Event'}' on {parsed_date} at {parsed_time}."
 
 
 # Singleton
