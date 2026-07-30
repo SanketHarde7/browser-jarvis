@@ -241,7 +241,10 @@ class ResponseGatekeeper:
             else:
                 result = trunc.rstrip(" ,;") + "."
 
-        return result.strip()
+        res = result.strip()
+        if not res and text.strip():
+            return "Here is what you requested."
+        return res
 
 
 # Singleton
