@@ -212,9 +212,14 @@ class ResponseGatekeeper:
         return result
 
     def filter_for_tts(self, text: str, max_chars: int = 350) -> str:
-        """Aggressive filter for TTS — strips emojis, code blocks, markdown, trims to clean sentence boundary."""
+        """Legacy filter for TTS — truncates text."""
+        chunks = self.chunk_for_tts(text, max_chars)
+        return chunks[0] if chunks else ""
+
+    def chunk_for_tts(self, text: str, max_chars: int = 250) -> List[str]:
+        """Aggressive filter for TTS — strips emojis/markdown and smartly chunks text into sentences."""
         if not text:
-            return ""
+            return []
 
         # Strip code blocks and markdown fences for spoken audio
         result = re.sub(r"```[\s\S]*?```", "", text)
@@ -228,23 +233,50 @@ class ResponseGatekeeper:
             result = rule.apply(result)
         
         result = re.sub(r" {2,}", " ", result).strip()
+        if not result:
+            return ["Here is what you requested."] if text.strip() else []
 
-        # Smart truncation at sentence boundary for fast Kokoro audio synthesis
-        if len(result) > max_chars:
-            trunc = result[:max_chars]
-            # Find last sentence boundary
-            for delim in ['. ', '! ', '? ', '; ']:
-                last = trunc.rfind(delim)
-                if last > 80:
-                    result = trunc[:last + 1].strip()
-                    break
+        # Smart chunking by sentence boundaries
+        chunks = []
+        # split by punctuation keeping the punctuation
+        sentences = re.split(r'(?<=[.!?\n])\s+', result)
+        
+        current_chunk = ""
+        for sentence in sentences:
+            sentence = sentence.strip()
+            if not sentence:
+                continue
+            
+            # If a single sentence is incredibly long (rare), hard split it
+            if len(sentence) > max_chars:
+                if current_chunk:
+                    chunks.append(current_chunk.strip())
+                    current_chunk = ""
+                
+                # Hard split by commas or just brute force
+                sub_parts = re.split(r'(?<=,)\s+', sentence)
+                temp_sub = ""
+                for sub in sub_parts:
+                    if len(temp_sub) + len(sub) <= max_chars:
+                        temp_sub += " " + sub
+                    else:
+                        if temp_sub: chunks.append(temp_sub.strip())
+                        temp_sub = sub
+                if temp_sub:
+                    current_chunk = temp_sub.strip()
+                continue
+                
+            if len(current_chunk) + len(sentence) <= max_chars:
+                current_chunk += (" " if current_chunk else "") + sentence
             else:
-                result = trunc.rstrip(" ,;") + "."
-
-        res = result.strip()
-        if not res and text.strip():
-            return "Here is what you requested."
-        return res
+                if current_chunk:
+                    chunks.append(current_chunk.strip())
+                current_chunk = sentence
+                
+        if current_chunk:
+            chunks.append(current_chunk.strip())
+            
+        return chunks
 
 
 # Singleton
