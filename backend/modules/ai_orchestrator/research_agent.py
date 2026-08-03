@@ -7,7 +7,11 @@ import urllib.parse
 import platform as os_platform
 import pyperclip
 from pathlib import Path
-import undetected_chromedriver as uc
+# codex-changes detail: keep research module importable when browser automation dependency is not installed.
+try:
+    import undetected_chromedriver as uc
+except ImportError:
+    uc = None
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
@@ -32,6 +36,9 @@ class DeepResearchAgent:
         logger.info(f"📁 Research Folder initialized at: {self.research_dir}")
 
     def _init_browser(self):
+        # codex-changes detail: surface a clear runtime error only when deep browser research is invoked.
+        if uc is None:
+            raise RuntimeError("undetected-chromedriver is not installed; deep browser research is unavailable.")
         if not self.driver:
             logger.info("Initializing Stateful Browser for Deep Research...")
             options = uc.ChromeOptions()

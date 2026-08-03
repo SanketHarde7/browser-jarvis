@@ -10,7 +10,11 @@ import platform as os_platform
 from typing import Dict, Optional, Tuple
 
 import pyperclip
-import undetected_chromedriver as uc
+# codex-changes detail: make browser automation an optional runtime capability instead of breaking orchestrator imports.
+try:
+    import undetected_chromedriver as uc
+except ImportError:
+    uc = None
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
@@ -38,6 +42,9 @@ class BrowserManager:
     # ──────────────────────────────────────────────
     def _ensure_browser(self):
         """Start Chrome if not already running (called internally, lock held by caller)."""
+        # codex-changes detail: raise a targeted error only when browser automation is actually used.
+        if uc is None:
+            raise RuntimeError("undetected-chromedriver is not installed; browser automation is unavailable.")
         if self._driver:
             try:
                 # Quick health check — will throw if browser crashed
