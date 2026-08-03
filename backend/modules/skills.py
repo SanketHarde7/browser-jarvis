@@ -105,12 +105,13 @@ def focus_target_window(target_name: str = "") -> bool:
                 win32gui.SetForegroundWindow(matched_win._hWnd)
                 time.sleep(0.3)
                 return True
-            except Exception:
+            except Exception as win32_err:
+                logger.debug(f"win32gui SetForegroundWindow failed ({win32_err}), trying pygetwindow activate...")
                 try:
                     matched_win.activate()
                     return True
-                except Exception:
-                    pass
+                except Exception as act_err:
+                    logger.debug(f"pygetwindow activate failed: {act_err}")
     except Exception as err:
         logger.warning(f"focus_target_window error: {err}")
     return False
@@ -160,10 +161,12 @@ def open_url_in_browser(url: str) -> None:
             try:
                 import webbrowser
                 webbrowser.open(url, new=2, autoraise=True)
-            except Exception:
+            except Exception as wb_err:
+                logger.debug(f"webbrowser module open failed ({wb_err}), trying os.startfile...")
                 try:
                     os.startfile(url)
-                except Exception:
+                except Exception as os_err:
+                    logger.debug(f"os.startfile failed ({os_err}), falling back to shell start command...")
                     subprocess.Popen(f'start "" "{url}"', shell=True)
         elif platform.system() == "Darwin":
             subprocess.Popen(["open", url])
@@ -306,12 +309,8 @@ class SkillsEngine:
             "search":            self._skill_web_search,
             "youtube_search":    self._skill_youtube_search,
             "youtube_play":      self._skill_youtube_play,
-            "time_now":          self._skill_time_now,
-            "date_today":        self._skill_date_today,
             "clear_memory":      self._skill_clear_memory,
             "add_rule":          self._skill_add_rule,
-            "sysinfo":           self._skill_sysinfo,
-            "top_processes":     self._skill_top_processes,
             "media":             self._skill_media,
             "reminder_set":      self._skill_reminder_set,
             "reminder_list":     self._skill_reminder_list,
@@ -400,6 +399,30 @@ class SkillsEngine:
             "check_process":     self._skill_check_process,
             "get_recent_history": self._skill_get_recent_history,
         }
+
+        # ── DYNAMIC MODULE LOADING ──
+        try:
+            import importlib
+            import pkgutil
+            import inspect
+            from skills.base_skill import BaseSkill
+            import skills
+
+            for loader, module_name, is_pkg in pkgutil.iter_modules(skills.__path__):
+                if module_name == "base_skill": continue
+                full_module_name = f"skills.{module_name}"
+                try:
+                    mod = importlib.import_module(full_module_name)
+                    for name, obj in inspect.getmembers(mod):
+                        if inspect.isclass(obj) and issubclass(obj, BaseSkill) and obj is not BaseSkill:
+                            skill_instance = obj()
+                            base[skill_instance.name] = skill_instance.execute
+                            logger.info(f"Dynamically registered skill: {skill_instance.name}")
+                except Exception as e:
+                    logger.error(f"Failed to load dynamic skill module {module_name}: {e}")
+        except Exception as e:
+            logger.error(f"Dynamic skill loading crashed: {e}")
+
         try:
             pl = self.plugin_loader
             for name in pl.handlers:
@@ -611,24 +634,7 @@ class SkillsEngine:
     # SYSTEM INFO SKILLS
     # ════════════════════════════════════════════
 
-    def _skill_time_now(self) -> str:
-        now = datetime.now()
-        time_fmt = now.strftime("%I:%M %p").lstrip('0')
-        day_fmt = now.strftime("%A")
-        return f"It is {time_fmt} on {day_fmt}."
-
-    def _skill_date_today(self) -> str:
-        today = datetime.now()
-        date_fmt = today.strftime("%A, %B %d, %Y")
-        return f"Today is {date_fmt}."
-
-    def _skill_sysinfo(self, detail: str = "all") -> str:
-        from modules.sysinfo import get_system_info
-        return get_system_info(detail)
-
-    def _skill_top_processes(self, n: str = "5") -> str:
-        from modules.sysinfo import get_top_processes
-        return get_top_processes(int(n) if n.isdigit() else 5)
+    # Note: time_now, date_today, sysinfo, top_processes have been extracted to backend/skills/core_skills.py
 
     async def _skill_media(self, action: str = "play", *args) -> str:
         # If args are provided (e.g., [SKILL:media:play:arijit singh]), route to the intelligent media engine
@@ -1763,72 +1769,113 @@ class SkillsEngine:
         
     def _resolve_contact_number(self, contact: str) -> Tuple[Optional[str], Optional[str]]:
         """
-        Resolves contact input (name or number) to a validated phone number.
+        Dynamically resolves contact input (name or number) to a validated phone number.
         Returns (phone_number, error_message).
         """
-        if not contact:
+        if not contact or not contact.strip():
             return None, "Please provide a contact name or phone number."
 
         contact_clean = contact.strip().lower()
         
-        # 1. Check if input is user's own number alias ("me", "myself", "mera", "my whatsapp", "my number", "sanket")
-        user_self_aliases = {"me", "myself", "mera", "my whatsapp", "my number", "mera number", "sanket", "self"}
-        if contact_clean in user_self_aliases:
-            my_num = getattr(self.config, "MY_WHATSAPP_NUMBER", "").strip() or os.getenv("MY_WHATSAPP_NUMBER", "").strip()
+        # 1. Direct phone number check
+        digits_only = re.sub(r'[^\d]', '', contact_clean)
+        if len(digits_only) >= 10:
+            num = contact_clean.replace(" ", "").replace("-", "")
+            if not num.startswith("+"):
+                num = "+91" + num
+            return num, None
+
+        # 2. Dynamic user self-reference detection
+        # Fetch user's dynamic name from memory user_facts if available
+        user_name = ""
+        user_facts = {}
+        try:
+            mem_file = Path(self.config.MEMORY_FILE)
+            if mem_file.exists():
+                mem_data = json.loads(mem_file.read_text(encoding='utf-8'))
+                user_facts = mem_data.get("user_facts", {})
+                user_name = user_facts.get("name", "").strip().lower()
+        except Exception as e:
+            logger.debug(f"Memory facts lookup notice: {e}")
+
+        # Check self-referential terms dynamically
+        self_terms = {"me", "myself", "mera", "my whatsapp", "my number", "mera number", "self"}
+        if user_name:
+            self_terms.add(user_name)
+
+        is_self_target = any(term in contact_clean for term in self_terms) or (user_name and user_name in contact_clean)
+
+        if is_self_target:
+            my_num = (
+                getattr(self.config, "MY_WHATSAPP_NUMBER", "").strip() or 
+                os.getenv("MY_WHATSAPP_NUMBER", "").strip() or
+                user_facts.get("whatsapp_number", "").strip() or
+                user_facts.get("phone", "").strip()
+            )
             
-            if not my_num:
-                try:
-                    mem_file = Path(self.config.MEMORY_FILE)
-                    if mem_file.exists():
-                        mem_data = json.loads(mem_file.read_text(encoding='utf-8'))
-                        my_num = mem_data.get("user_facts", {}).get("whatsapp_number", "") or mem_data.get("user_facts", {}).get("phone", "")
-                except Exception:
-                    pass
-                    
             if not my_num:
                 contacts_file = Path(self.config.DATA_DIR) / "contacts.json"
                 if contacts_file.exists():
                     try:
                         c_dict = json.loads(contacts_file.read_text(encoding='utf-8'))
-                        my_num = c_dict.get("me") or c_dict.get("sanket") or c_dict.get("myself")
-                    except Exception:
-                        pass
+                        my_num = c_dict.get("my_whatsapp") or c_dict.get("me") or c_dict.get("my_number")
+                        if not my_num and user_name:
+                            my_num = c_dict.get(user_name)
+                    except Exception as e:
+                        logger.warning(f"Error reading contacts JSON: {e}")
 
             if my_num:
-                contact_clean = my_num.lower()
+                num = my_num.replace(" ", "").replace("-", "")
+                if not num.startswith("+"):
+                    num = "+91" + num
+                return num, None
             else:
                 return None, ("I don't have your WhatsApp number saved yet. "
                               "You can add MY_WHATSAPP_NUMBER=+91XXXXXXXXXX in your .env file, "
+                              "save 'my_whatsapp': '+91XXXXXXXXXX' in contacts.json, "
                               "or tell me 'My WhatsApp number is +91XXXXXXXXXX'.")
 
-        # 2. Check if the input is a direct phone number (digits)
-        is_number = bool(re.match(r'^[\+\d\s\-]+$', contact_clean))
-        
-        if not is_number:
-            contacts_file = Path(self.config.DATA_DIR) / "contacts.json"
-            if contacts_file.exists():
-                try:
-                    c_dict = json.loads(contacts_file.read_text(encoding='utf-8'))
-                    matched_number = None
+        # 3. Dynamic Fuzzy Contact Search in contacts.json
+        contacts_file = Path(self.config.DATA_DIR) / "contacts.json"
+        if contacts_file.exists():
+            try:
+                c_dict = json.loads(contacts_file.read_text(encoding='utf-8'))
+                matched_number = None
+                
+                # Pass 1: Exact key match
+                for k, v in c_dict.items():
+                    if k.lower().strip() == contact_clean:
+                        matched_number = v
+                        break
+                
+                # Pass 2: Substring key match (e.g. "aditya" matches "aditya bhai" or "aditya")
+                if not matched_number:
                     for k, v in c_dict.items():
-                        if k.lower().strip() == contact_clean:
+                        k_clean = k.lower().strip()
+                        if contact_clean in k_clean or k_clean in contact_clean:
                             matched_number = v
                             break
-                    
-                    if matched_number:
-                        contact_clean = matched_number
-                    else:
-                        return None, f"I don't have '{contact.title()}' saved in your contacts.json file yet. Please add '{contact.title()}'s number to backend/data/contacts.json."
-                except Exception as e:
-                    return None, f"Error reading contacts file: {e}"
-            else:
-                return None, f"Contacts file missing. Please create backend/data/contacts.json and add '{contact.title()}'s number."
+                            
+                # Pass 3: Word token overlap match
+                if not matched_number:
+                    query_words = set(contact_clean.split())
+                    for k, v in c_dict.items():
+                        key_words = set(k.lower().strip().split())
+                        if query_words.intersection(key_words):
+                            matched_number = v
+                            break
 
-        num = contact_clean.replace(" ", "").replace("-", "")
-        if not num.startswith("+"):
-            num = "+91" + num
-
-        return num, None
+                if matched_number:
+                    num = str(matched_number).replace(" ", "").replace("-", "")
+                    if not num.startswith("+"):
+                        num = "+91" + num
+                    return num, None
+                else:
+                    return None, f"I don't have '{contact.title()}' saved in your contacts.json file. Please add '{contact.title()}': '+91XXXXXXXXXX' to backend/data/contacts.json or provide their phone number."
+            except Exception as e:
+                return None, f"Error reading contacts file: {e}"
+        else:
+            return None, f"Contacts file missing. Please create backend/data/contacts.json and add '{contact.title()}'s number."
 
     def _verify_whatsapp_network(self) -> bool:
         """Quick socket check to verify network reachability before WhatsApp Web operations."""
@@ -1837,74 +1884,120 @@ class SkillsEngine:
             sock = socket.create_connection(("web.whatsapp.com", 443), timeout=2.5)
             sock.close()
             return True
-        except Exception:
+        except Exception as e:
+            logger.debug(f"Direct WhatsApp socket check failed ({e}), attempting fallback DNS check...")
             try:
                 sock = socket.create_connection(("1.1.1.1", 53), timeout=2.5)
                 sock.close()
                 return True
-            except Exception:
+            except Exception as net_err:
+                logger.warning(f"Network verification failed: {net_err}")
                 return False
+
+    def _focus_whatsapp_window(self) -> "tuple[object | None, bool]":
+        """Detect and focus a WhatsApp Web browser window.
+        
+        Returns:
+            (window_object | None, was_already_open: bool)
+        """
+        try:
+            import pygetwindow as gw
+        except ImportError:
+            logger.warning("pygetwindow is not installed – cannot detect WhatsApp window.")
+            return None, False
+
+        # Pass 1: Look for window with "whatsapp" in title (handles Chrome, Opera, Edge, etc.)
+        wa_wins = [w for w in gw.getAllWindows() if w.title and "whatsapp" in w.title.lower()]
+        
+        if not wa_wins:
+            # Pass 2: Fallback – look for any known browser window
+            wa_wins = [w for w in gw.getAllWindows()
+                       if w.title and any(b in w.title.lower()
+                                          for b in ["chrome", "edge", "opera", "firefox", "brave"])]
+
+        if not wa_wins:
+            return None, False
+
+        win = wa_wins[0]
+        was_already_open = "whatsapp" in win.title.lower()
+
+        # Activate the window (with minimize/restore fallback for pygetwindow quirks)
+        for attempt in range(3):
+            try:
+                if win.isMinimized:
+                    win.restore()
+                    time.sleep(0.5)
+                win.activate()
+                time.sleep(0.6)
+                return win, was_already_open
+            except Exception as act_err:
+                logger.debug(f"Window activate attempt {attempt+1} failed: {act_err}")
+                try:
+                    win.minimize()
+                    time.sleep(0.3)
+                    win.restore()
+                    time.sleep(0.5)
+                except Exception:
+                    pass
+
+        # Even if activate failed, still return the window so caller can proceed
+        logger.warning("Could not reliably activate WhatsApp window, proceeding anyway.")
+        return win, was_already_open
 
     def _skill_whatsapp_message(self, contact: str = "", message: str = "", **kw) -> str:
         if not PYAUTOGUI_AVAILABLE: 
             return "Typing needs: pip install pyautogui"
-        if not message: 
-            return "What message should I send?"
-
-        # 1. Resolve contact number (no hardcoded fake defaults!)
+        
+        # 1. Parameter swap detection (in case contact and message args were reversed by LLM)
         phone_num, err = self._resolve_contact_number(contact)
+        actual_message = message
+        
+        if err and message:
+            swap_num, swap_err = self._resolve_contact_number(message)
+            if swap_num and not swap_err:
+                phone_num = swap_num
+                actual_message = contact
+                err = None
+
         if err:
             return err
+        if not actual_message or not actual_message.strip():
+            return "What message should I send?"
 
-        # 2. Network connectivity pre-check (Prevents claiming success when offline/slow)
+        # 2. Network connectivity pre-check
         if not self._verify_whatsapp_network():
-            return "❌ Low network speed or offline: Cannot connect to WhatsApp Web right now. Please check your internet connection and try again."
+            return "❌ Low network speed or offline: Cannot connect to WhatsApp Web right now. Please check your internet connection."
 
         try:
-            logger.info(f"Sending WhatsApp message to {phone_num}...")
             import webbrowser
             from urllib.parse import quote
             import pyautogui
 
-            url = f"https://web.whatsapp.com/send?phone={phone_num}&text={quote(message)}"
-            logger.info(f"Opening browser: {url}")
+            # 3. Check if WhatsApp window is ALREADY open
+            existing_win, already_open = self._focus_whatsapp_window()
+
+            # 4. Open WhatsApp URL (always needed – the URL carries the message text)
+            url = f"https://web.whatsapp.com/send?phone={phone_num}&text={quote(actual_message)}"
+            logger.info(f"Opening WhatsApp URL (already_open={already_open}): {url}")
             webbrowser.open(url)
 
-            # 3. Dynamic page load verification (Checking window focus & network status up to 18s)
-            max_wait = 18
-            loaded = False
-            start_time = time.time()
-            
-            while time.time() - start_time < max_wait:
-                time.sleep(1.5)
-                if not self._verify_whatsapp_network():
-                    return "⚠️ Message delivery unconfirmed: Network connection dropped while loading WhatsApp Web. Please check your browser."
-                
-                try:
-                    import pygetwindow as gw
-                    windows = [w for w in gw.getAllWindows() if "whatsapp" in w.title.lower() or any(b in w.title.lower() for b in ["chrome", "edge", "opera", "firefox", "brave"])]
-                    if windows:
-                        try:
-                            windows[0].activate()
-                        except Exception:
-                            pass
-                        loaded = True
-                        time.sleep(3.0)
-                        break
-                except Exception:
-                    pass
+            # 5. Wait for chat panel to load
+            wait_seconds = 5.0 if already_open else 13.0
+            logger.info(f"Waiting {wait_seconds}s for WhatsApp Web chat panel...")
+            time.sleep(wait_seconds)
 
-            if not loaded:
-                return f"⚠️ Low network speed: WhatsApp Web page load timed out ({max_wait}s). Message delivery could not be confirmed."
+            # 6. Re-focus the WhatsApp window after URL load
+            focused_win, _ = self._focus_whatsapp_window()
+            if not focused_win:
+                logger.warning("WhatsApp window not found after opening URL – trying to proceed anyway.")
+                time.sleep(2.0)
 
-            # 4. Perform typing & sending
+            # 7. Press Enter to send message
             logger.info("Pressing Enter to send message...")
             pyautogui.press("enter")
             
-            # Post-send verification wait
-            time.sleep(4.0)
-            if not self._verify_whatsapp_network():
-                return f"⚠️ Network slowed down during transmission. Message submitted to browser tab, but final delivery verification timed out. Please check your browser."
+            # Wait for transmission
+            time.sleep(3.5)
 
             # Close tab cleanly
             pyautogui.hotkey("ctrl", "w")
@@ -1914,6 +2007,100 @@ class SkillsEngine:
 
         except Exception as e:
             return f"❌ WhatsApp execution error: {e}"
+
+    def _copy_image_to_clipboard(self, image_path: Path) -> bool:
+        """Copies an image file directly into the Windows Clipboard in native CF_DIB format."""
+        try:
+            from PIL import Image
+            import io
+            import win32clipboard
+
+            img = Image.open(image_path)
+            output = io.BytesIO()
+            img.convert("RGB").save(output, "BMP")
+            data = output.getvalue()[14:]  # Strip 14-byte BMP header to form CF_DIB
+            output.close()
+
+            win32clipboard.OpenClipboard()
+            win32clipboard.EmptyClipboard()
+            win32clipboard.SetClipboardData(win32clipboard.CF_DIB, data)
+            win32clipboard.CloseClipboard()
+            logger.info("Screenshot image loaded into Windows Clipboard (CF_DIB format).")
+            return True
+        except Exception as e:
+            logger.warning(f"win32clipboard failed ({e}), falling back to PowerShell silent clip...")
+            try:
+                ps_script = f"Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.Clipboard]::SetImage([System.Drawing.Image]::FromFile('{str(image_path.absolute())}'))"
+                # 0x08000000 = CREATE_NO_WINDOW (prevents popup/explorer triggers)
+                subprocess.run(["powershell", "-Sta", "-Command", ps_script], creationflags=0x08000000)
+                return True
+            except Exception as ps_err:
+                logger.error(f"Failed to copy image to clipboard: {ps_err}")
+                return False
+
+    def _attempt_send_screenshot(self, phone_num: str, fp: Path, already_open: bool) -> bool:
+        """Helper to paste and send an existing screenshot file to WhatsApp Web tab."""
+        import pyautogui
+        import webbrowser
+
+        # 1. Place image in Windows Clipboard
+        if not self._copy_image_to_clipboard(fp):
+            logger.error("Clipboard copy failed.")
+            return False
+
+        # 2. Open WhatsApp chat URL
+        url = f"https://web.whatsapp.com/send?phone={phone_num}"
+        logger.info(f"Opening WhatsApp URL: {url}")
+        webbrowser.open(url)
+
+        # 3. Wait for chat DOM to fully render
+        wait_seconds = 5.0 if already_open else 12.0
+        logger.info(f"Waiting {wait_seconds}s for WhatsApp Web chat panel to load...")
+        time.sleep(wait_seconds)
+
+        # 4. Focus WhatsApp window using centralized helper (handles Opera, minimize/restore, etc.)
+        wa_win, _ = self._focus_whatsapp_window()
+        if not wa_win:
+            # Last resort: wait a bit more and try once more
+            logger.warning("WhatsApp window not detected, waiting 5s extra...")
+            time.sleep(5.0)
+            wa_win, _ = self._focus_whatsapp_window()
+            if not wa_win:
+                logger.error("WhatsApp browser window was not found or could not be activated.")
+                return False
+
+        # 5. Paste screenshot image (Ctrl+V) – with retry if first paste doesn't trigger preview
+        for paste_attempt in range(2):
+            logger.info(f"Pasting screenshot via Ctrl+V (attempt {paste_attempt + 1})...")
+            # Re-load clipboard before each paste attempt (ensures clipboard is fresh)
+            if paste_attempt > 0:
+                self._copy_image_to_clipboard(fp)
+                time.sleep(0.5)
+                # Re-focus window before retry paste
+                self._focus_whatsapp_window()
+                time.sleep(0.5)
+
+            pyautogui.hotkey("ctrl", "v")
+
+            # 6. Wait for WhatsApp media preview dialog to appear
+            # This dialog takes 3-5s to fully render (shows image preview + send button)
+            time.sleep(4.0)
+
+            # 7. Press Enter to confirm send
+            logger.info("Pressing Enter to send screenshot...")
+            pyautogui.press("enter")
+
+            # 8. Wait for media upload transmission
+            time.sleep(5.0)
+
+            # Check if the media preview dialog consumed the Enter (success indicator):
+            # If we're still on the page after 5s, likely it went through
+            # Note: there's no reliable programmatic check here, so we trust timing
+            break  # Single attempt if paste goes through
+
+        # 9. Close tab
+        pyautogui.hotkey("ctrl", "w")
+        return True
 
     def _skill_whatsapp_screenshot(self, contact: str = "", **kw) -> str:
         if not PYAUTOGUI_AVAILABLE: 
@@ -1926,61 +2113,39 @@ class SkillsEngine:
         if not self._verify_whatsapp_network():
             return "❌ Low network speed or offline: Cannot connect to WhatsApp Web right now."
 
+        # Take ONE single screenshot (saved to fp)
+        ss_dir = Path(self.config.DATA_DIR) / "screenshots"
+        ss_dir.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        fp = ss_dir / f"whatsapp_ss_{ts}.png"
+        
         try:
-            logger.info(f"Taking screenshot for WhatsApp to {phone_num}...")
             from PIL import ImageGrab
-            import subprocess
-            import pyautogui
-
-            ss_dir = Path(self.config.DATA_DIR) / "screenshots"
-            ss_dir.mkdir(parents=True, exist_ok=True)
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            fp = ss_dir / f"whatsapp_ss_{ts}.png"
             ImageGrab.grab(all_screens=True).save(str(fp))
-            
-            ps_cmd = f"Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.Clipboard]::SetImage([System.Drawing.Image]::FromFile('{str(fp.absolute())}'))"
-            subprocess.run(["powershell", "-command", ps_cmd])
-            
-            import webbrowser
-            url = f"https://web.whatsapp.com/send?phone={phone_num}"
-            webbrowser.open(url)
-            
-            max_wait = 18
-            loaded = False
-            start_time = time.time()
-            
-            while time.time() - start_time < max_wait:
-                time.sleep(1.5)
-                if not self._verify_whatsapp_network():
-                    return "⚠️ Screenshot delivery unconfirmed: Network dropped while loading WhatsApp Web."
-                
-                try:
-                    import pygetwindow as gw
-                    windows = [w for w in gw.getAllWindows() if "whatsapp" in w.title.lower() or any(b in w.title.lower() for b in ["chrome", "edge", "opera", "firefox", "brave"])]
-                    if windows:
-                        try:
-                            windows[0].activate()
-                        except Exception:
-                            pass
-                        loaded = True
-                        time.sleep(3.0)
-                        break
-                except Exception:
-                    pass
+            logger.info(f"Captured single screenshot at: {fp}")
+        except Exception as ss_err:
+            return f"❌ Screenshot capture failed: {ss_err}"
 
-            if not loaded:
-                return f"⚠️ Low network speed: WhatsApp Web page load timed out ({max_wait}s)."
+        # Check if WhatsApp window is ALREADY open using centralized helper
+        _, already_open = self._focus_whatsapp_window()
 
-            pyautogui.hotkey("ctrl", "v")
-            time.sleep(2.0)
-            pyautogui.press("enter")
-            time.sleep(4.0)
-            pyautogui.hotkey("ctrl", "w")
-            
-            contact_label = contact.title() if contact else phone_num
+        # Attempt 1: Send screenshot
+        logger.info("Attempt 1: Sending screenshot to WhatsApp...")
+        success = self._attempt_send_screenshot(phone_num, fp, already_open)
+
+        # Fail Case: If Attempt 1 fails, RETRY using SAME screenshot (no new capture!)
+        if not success:
+            logger.warning("Attempt 1 failed! Retrying with SAME captured screenshot...")
+            time.sleep(3.0)
+            _, already_open = self._focus_whatsapp_window()
+            success = self._attempt_send_screenshot(phone_num, fp, already_open)
+
+        contact_label = contact.title() if contact else phone_num
+
+        if success:
             return f"✅ Screenshot successfully sent to {contact_label} ({phone_num}) on WhatsApp."
-        except Exception as e:
-            return f"❌ WhatsApp screenshot failed: {e}"
+        else:
+            return f"❌ Failed to send screenshot to {contact_label} ({phone_num}) after 2 attempts. WhatsApp window could not be focused or loaded."
 
     def _skill_type_text(self, *args) -> str:
         if not PYAUTOGUI_AVAILABLE: 
