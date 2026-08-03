@@ -158,12 +158,47 @@ body {
   background-image: linear-gradient(180deg, #4a148c, #f50057, #aa00ff, #f50057, #4a148c);
 }
 
+
+
 /* ══════════════════════════════════════════════════════════════ */
 
 .ambient-screen-glow {
   position: absolute;
   inset: 0;
   box-shadow: inset 0 0 80px rgba(0, 0, 0, 0.15);
+}
+
+/* ══════════════════════════════════════════════════════════════ */
+/* IDLE THEME (Random Monochromatic Family with Chemical Mix) */
+
+.theme-idle-layer {
+  /* Use the same gas flow animation as others */
+  animation: gasFlowHorizontal 10s linear infinite, gasPulse 6s cubic-bezier(0.4, 0, 0.2, 1) infinite alternate;
+}
+
+/* Chemical mixing mask animation for right-to-left smooth transition */
+.chemical-mix-enter {
+  -webkit-mask-image: linear-gradient(to right, transparent 33%, black 66%);
+  mask-image: linear-gradient(to right, transparent 33%, black 66%);
+  -webkit-mask-size: 300% 100%;
+  mask-size: 300% 100%;
+  -webkit-mask-repeat: no-repeat;
+  mask-repeat: no-repeat;
+  /* 4 seconds for a slow, organic mixing effect */
+  animation: chemicalMix 4s cubic-bezier(0.4, 0, 0.2, 1) forwards, gasFlowHorizontal 10s linear infinite, gasPulse 6s cubic-bezier(0.4, 0, 0.2, 1) infinite alternate;
+}
+
+@keyframes chemicalMix {
+  0% { 
+    -webkit-mask-position: 0% 0%; 
+    mask-position: 0% 0%; 
+    opacity: 0.5;
+  }
+  100% { 
+    -webkit-mask-position: 100% 0%; 
+    mask-position: 100% 0%; 
+    opacity: 1;
+  }
 }
 
 @keyframes gasFlowHorizontal {
