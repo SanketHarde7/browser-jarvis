@@ -18,7 +18,7 @@ import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { availableMonitors, getCurrentWindow } from "@tauri-apps/api/window";
-import { LogicalSize, PhysicalPosition } from "@tauri-apps/api/dpi";
+import { PhysicalPosition } from "@tauri-apps/api/dpi";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { useBackend, BackendMessage, BackendStatus } from "./hooks/useBackend";
 import { useVoice } from "./hooks/useVoice";
@@ -33,7 +33,7 @@ const TEXT_WINDOW_LABEL = "overlay";
 const TEXT_WINDOW_CONTENT_KEY = "max-text-window-content";
 const TEXT_WINDOW_VISIBLE_KEY = "max-text-window-visible";
 
-type OrbState = "idle" | "listening" | "processing" | "speaking" | "error" | "offline";
+type OrbState = "idle" | "listening" | "processing" | "speaking" | "error" | "offline" | "music_listening";
 
 const App: React.FC = () => {
   const mainWindowRef = useRef(getCurrentWindow());
@@ -52,6 +52,7 @@ const App: React.FC = () => {
   const currentCommandIdRef = useRef<string>("");
   const lastSpeechEndRef = useRef<number>(0);
   const orbStateRef = useRef<OrbState>("idle");
+  const queuedOrbStateRef = useRef<OrbState | null>(null);
 
   // Keep orbStateRef in sync
   useEffect(() => {
@@ -78,7 +79,7 @@ const App: React.FC = () => {
 
   // ── Orb visual state ──
   useEffect(() => {
-    const activeStates = ["listening", "processing", "speaking"];
+    const activeStates = ["listening", "processing", "speaking", "music_listening"];
     localStorage.setItem("max-overlay-state", orbState);
     setIsOrbHidden(localStorage.getItem("max-orb-hidden") === "1");
     if (activeStates.includes(orbState)) {
@@ -112,6 +113,8 @@ const App: React.FC = () => {
       audioRef.current.src = "";
       audioRef.current = null;
     }
+    // Flush the queue instantly so remaining chunks abort
+    audioQueueRef.current = [];
   }, []);
 
   // ── Text Window helpers ──
@@ -182,14 +185,6 @@ const App: React.FC = () => {
         mainWindowRef.current.outerSize(),
       ]);
 
-      const totalChars = Math.max(1, text.length);
-      const preferredWidth = Math.ceil(Math.min(720, Math.max(260, Math.sqrt(totalChars) * 28)));
-      const approxCharWidth = 8;
-      const charsPerLine = Math.max(18, Math.floor(preferredWidth / approxCharWidth));
-      const lines = Math.max(1, Math.ceil(totalChars / charsPerLine));
-      const estimatedWidth = Math.max(260, Math.min(900, preferredWidth));
-      const estimatedHeight = Math.max(140, Math.min(1200, 80 + lines * 30));
-
       const desiredX = position.x + size.width + 6;
       localStorage.setItem(
         "max-text-window-position",
@@ -199,7 +194,6 @@ const App: React.FC = () => {
       if (tw) {
         await tw.setAlwaysOnTop(true).catch(() => {});
         await tw.setResizable(true).catch(() => {});
-        await tw.setSize(new LogicalSize(estimatedWidth, estimatedHeight)).catch(() => {});
         await tw.setPosition(new PhysicalPosition(desiredX, position.y)).catch(() => {});
         await tw.show().catch(() => {});
       }
@@ -257,10 +251,16 @@ const App: React.FC = () => {
     }
 
     const { rawBase64, hibernateAfter, isHealthAlert } = nextAudio;
+    if (orbStateRef.current === "music_listening") {
+        queuedOrbStateRef.current = "music_listening";
+    }
     setOrbState("speaking");
     const audio = new Audio(`data:audio/mp3;base64,${rawBase64}`);
     audioRef.current = audio;
     audio.volume = isHealthAlert ? 0.35 : 1.0;
+    
+    // Notify backend to duck music
+    send({ type: "audio_playback_started" });
 
     const scheduleHide = () => {
       if (islandTimerRef.current) clearTimeout(islandTimerRef.current);
@@ -272,6 +272,7 @@ const App: React.FC = () => {
     return new Promise<void>((resolve) => {
       audio.onended = async () => {
         audioRef.current = null;
+        send({ type: "audio_playback_ended" });
         if (hibernateAfter) {
           await triggerHibernate("audio-ended");
         }
@@ -280,6 +281,7 @@ const App: React.FC = () => {
 
       audio.onerror = () => {
         audioRef.current = null;
+        send({ type: "audio_playback_ended" });
         if (hibernateAfter) {
           void triggerHibernate("audio-error");
         }
@@ -288,6 +290,7 @@ const App: React.FC = () => {
 
       audio.play().catch(() => {
         audioRef.current = null;
+        send({ type: "audio_playback_ended" });
         if (hibernateAfter) {
           void triggerHibernate("audio-play-failed");
         }
@@ -296,7 +299,14 @@ const App: React.FC = () => {
     }).then(() => {
       isPlayingRef.current = false;
       if (audioQueueRef.current.length === 0) {
-        setOrbState("idle");
+        if (queuedOrbStateRef.current) {
+          setOrbState(queuedOrbStateRef.current);
+          localStorage.setItem("max-overlay-state", queuedOrbStateRef.current);
+          queuedOrbStateRef.current = null;
+        } else {
+          setOrbState("idle");
+          localStorage.setItem("max-overlay-state", "idle");
+        }
         scheduleHide();
       } else {
         void processAudioQueue();
@@ -371,6 +381,17 @@ const App: React.FC = () => {
         if (msg.text) showToast(msg.text);
         break;
 
+      case "update_state":
+        if ((msg as any).state) {
+          const newState = (msg as any).state;
+          if (isPlayingRef.current) {
+            queuedOrbStateRef.current = newState;
+          } else {
+            setOrbState(newState);
+            localStorage.setItem("max-overlay-state", newState);
+          }
+        }
+        break;
       case "transcript":
         if (msg.text) {
           const intercepted = handleVoiceCommandInterpretation(msg.text);
