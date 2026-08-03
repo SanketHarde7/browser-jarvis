@@ -18,14 +18,46 @@ function readTextWindowState() {
 }
 
 function estimateWindowSize(text: string) {
+  // Constants for a professional, dynamically bounded UI
+  const MAX_WIDTH = 450;
+  const MIN_WIDTH = 280;
+  const MAX_HEIGHT = 550;
+  const MIN_HEIGHT = 120;
+
+  // Realistic font metrics for 15px sans-serif
+  const CHAR_WIDTH = 7.2;
+  const LINE_HEIGHT = 24;
+
+  const PADDING_WIDTH = 56; // Left+right padding + scrollbar leeway
+  const PADDING_HEIGHT = 74; // Top+bottom padding + title height
+
+  const textLength = text.length;
+  if (textLength === 0) {
+    return { width: MIN_WIDTH, height: MIN_HEIGHT };
+  }
+
+  // Compute width bounded by MIN/MAX
+  let width = Math.min(MAX_WIDTH, Math.max(MIN_WIDTH, Math.ceil(textLength * CHAR_WIDTH + PADDING_WIDTH)));
+
+  // Compute height based on line wrapping
+  const textAreaWidth = width - PADDING_WIDTH;
+  const charsPerLine = Math.max(10, Math.floor(textAreaWidth / CHAR_WIDTH));
+
   const lines = text.split(/\r?\n/);
-  const longestLine = lines.reduce((max, line) => Math.max(max, line.length), 0);
-  const lineCount = Math.max(1, lines.length);
+  let totalWrappedLines = 0;
 
-  const width = Math.max(220, Math.ceil(180 + longestLine * 5.2));
-  const height = Math.max(140, Math.ceil(110 + lineCount * 30 + Math.max(0, text.length - longestLine) * 0.22));
+  for (const line of lines) {
+    if (line.length === 0) {
+      totalWrappedLines += 1;
+    } else {
+      totalWrappedLines += Math.ceil(line.length / charsPerLine);
+    }
+  }
 
-  return { width, height };
+  let height = Math.min(MAX_HEIGHT, Math.max(MIN_HEIGHT, Math.ceil(totalWrappedLines * LINE_HEIGHT + PADDING_HEIGHT)));
+
+  // Add buffer for shadows and smooth resizing
+  return { width: width + 10, height: height + 10 };
 }
 
 export const TextWindow: React.FC = () => {
@@ -92,10 +124,10 @@ export const TextWindow: React.FC = () => {
 
     const chars = Array.from(text);
     const totalChars = chars.length;
-    let msPerChar = 40; // Default readable speed
-    if (totalChars > 600) msPerChar = 25; // Faster for very long text
-    else if (totalChars > 200) msPerChar = 32;
-    else if (totalChars > 60) msPerChar = 40;
+    let msPerChar = 65; // Slightly slower default for smoothness
+    if (totalChars > 600) msPerChar = 40; // Fast enough for very long text but not jarring
+    else if (totalChars > 200) msPerChar = 50;
+    else if (totalChars > 60) msPerChar = 65;
 
     let index = 0;
     setDisplayedText((prev) => {
