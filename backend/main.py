@@ -55,21 +55,42 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from config import config
 from agent_core import get_agent, register_websocket
-from modules.stt import transcribe_audio, transcribe_file, transcribe_wake_word, is_valid_transcript
-from modules.tts import generate_tts
-from modules.llm import get_greeting
-from modules.skills import get_skills_engine
-from modules.memory import get_memory_manager
-from modules.email_agent import get_email_agent
-from modules.calendar_agent import get_calendar_agent
-from modules.browser_agent import get_browser_agent
-from modules.smarthome_agent import get_smarthome_agent
-from modules.plugin_loader import get_plugin_loader
-from modules.knowledge_indexer import get_knowledge_indexer
-from modules.knowledge_base import get_knowledge_base
+from core.module_registry import registry
+
+# ── Dynamic Module Loading (Error Isolation) ──
+def _stub_transcribe(*args, **kwargs):
+    logging.getLogger("MAX.API").error("STT module unavailable.")
+    return ""
+def _stub_bool(*args, **kwargs): return False
+
+transcribe_audio = registry.get_function("modules.stt", "transcribe_audio", fallback=_stub_transcribe)
+transcribe_file = registry.get_function("modules.stt", "transcribe_file", fallback=_stub_transcribe)
+transcribe_wake_word = registry.get_function("modules.stt", "transcribe_wake_word", fallback=_stub_transcribe)
+is_valid_transcript = registry.get_function("modules.stt", "is_valid_transcript", fallback=_stub_bool)
+
+def _stub_tts(*args, **kwargs):
+    logging.getLogger("MAX.API").error("TTS module unavailable.")
+    return b""
+generate_tts = registry.get_function("modules.tts", "generate_tts", fallback=_stub_tts)
+
+def _stub_greeting(*args, **kwargs): return "Hello, systems are degraded."
+get_greeting = registry.get_function("modules.llm", "get_greeting", fallback=_stub_greeting)
+
+get_skills_engine = registry.get_function("modules.skills", "get_skills_engine", fallback=lambda: None)
+get_memory_manager = registry.get_function("modules.memory", "get_memory_manager", fallback=lambda: None)
+get_email_agent = registry.get_function("modules.email_agent", "get_email_agent", fallback=lambda: None)
+get_calendar_agent = registry.get_function("modules.calendar_agent", "get_calendar_agent", fallback=lambda: None)
+get_browser_agent = registry.get_function("modules.browser_agent", "get_browser_agent", fallback=lambda: None)
+get_smarthome_agent = registry.get_function("modules.smarthome_agent", "get_smarthome_agent", fallback=lambda: None)
+get_plugin_loader = registry.get_function("modules.plugin_loader", "get_plugin_loader", fallback=lambda: None)
+get_knowledge_indexer = registry.get_function("modules.knowledge_indexer", "get_knowledge_indexer", fallback=lambda: None)
+get_knowledge_base = registry.get_function("modules.knowledge_base", "get_knowledge_base", fallback=lambda: None)
+
 import threading as _threading
 import asyncio
-from modules.health_buddy import HealthBuddy
+
+# Fallback for HealthBuddy class type hint
+HealthBuddy = registry.get_function("modules.health_buddy", "HealthBuddy", fallback=type("HealthBuddy", (object,), {}))
 
 # ── Global WebSocket & Health Buddy References ──
 active_websocket: Optional[WebSocket] = None
@@ -206,17 +227,19 @@ async def _on_startup():
     """
     # 1. Reminder daemon
     try:
-        from modules.reminder_agent import start_reminder_daemon
-        start_reminder_daemon(config)
-        logger.info("Reminder daemon started")
+        start_reminder_daemon = registry.get_function("modules.reminder_agent", "start_reminder_daemon")
+        if start_reminder_daemon:
+            start_reminder_daemon(config)
+            logger.info("Reminder daemon started")
     except Exception as e:
         logger.warning(f"Reminder daemon failed: {e}")
 
     # 2. Knowledge base auto-index (runs in background thread, non-blocking)
     def _build_kb():
         try:
-            from modules.knowledge_base import auto_index_on_startup
-            auto_index_on_startup(config)
+            auto_index_on_startup = registry.get_function("modules.knowledge_base", "auto_index_on_startup")
+            if auto_index_on_startup:
+                auto_index_on_startup(config)
         except Exception as e:
             logger.warning(f"KB auto-index: {e}")
 
@@ -226,9 +249,10 @@ async def _on_startup():
     # To re-enable, uncomment the lines below:
     # try:
     #     global health_buddy_instance
-    #     health_buddy_instance = HealthBuddy(send_health_buddy_alert)
-    #     health_buddy_instance.start()
-    #     logger.info("Health Buddy started")
+    #     if HealthBuddy:
+    #         health_buddy_instance = HealthBuddy(send_health_buddy_alert)
+    #         health_buddy_instance.start()
+    #         logger.info("Health Buddy started")
     # except Exception as e:
     #     logger.warning(f"Health Buddy start failed: {e}")
 
@@ -252,8 +276,10 @@ async def _on_shutdown():
 @app.on_event("startup")
 async def startup_event():
     try:
-        get_knowledge_indexer(config).refresh_if_needed()
-        logger.info("Knowledge index ready.")
+        indexer = get_knowledge_indexer(config) if get_knowledge_indexer else None
+        if indexer:
+            indexer.refresh_if_needed()
+            logger.info("Knowledge index ready.")
     except Exception as e:
         logger.warning(f"Knowledge index startup failed: {e}")
         
@@ -455,8 +481,8 @@ async def process_voice_request(
         if not audio_data:
             return
 
-        from modules.stt import transcribe_audio
-        transcript = await transcribe_audio(audio_data)
+        _transcribe = registry.get_function("modules.stt", "transcribe_audio", fallback=_stub_transcribe)
+        transcript = await _transcribe(audio_data)
 
         if connection_state["current_request_id"] != rid:
             logger.info(f"Voice task {rid} discarded after transcription.")
@@ -506,7 +532,8 @@ async def process_voice_request(
         if is_follow_up:
             import glob
             import time
-            from modules.web_autopilot import CACHE_DIR
+            _web_autopilot_mod = registry.get_module("modules.web_autopilot")
+            CACHE_DIR = getattr(_web_autopilot_mod, "CACHE_DIR", Path(".")) if _web_autopilot_mod else Path(".")
             
             # Check both research cache AND code save dir for recently created files
             files = glob.glob(str(CACHE_DIR / "*.*"))
@@ -531,7 +558,9 @@ async def process_voice_request(
                 intercepted = True
             else:
                 # Check for LAST_BOT_BYPASS_URL from web_autopilot
-                from modules.web_autopilot import LAST_BOT_BYPASS_URL, clear_last_bot_bypass_url
+                _wa_mod = registry.get_module("modules.web_autopilot")
+                LAST_BOT_BYPASS_URL = getattr(_wa_mod, "LAST_BOT_BYPASS_URL", None) if _wa_mod else None
+                clear_last_bot_bypass_url = getattr(_wa_mod, "clear_last_bot_bypass_url", lambda: None) if _wa_mod else lambda: None
                 if LAST_BOT_BYPASS_URL:
                     logger.info(f"Intercepted follow-up: Opening bot bypass URL: {LAST_BOT_BYPASS_URL}")
                     skills._skill_web_open(LAST_BOT_BYPASS_URL)
@@ -734,7 +763,8 @@ async def websocket_endpoint(websocket: WebSocket, token: str = None, device: st
                     if is_text_follow_up:
                         import glob
                         import time as _time
-                        from modules.web_autopilot import CACHE_DIR
+                        _web_autopilot_mod2 = registry.get_module("modules.web_autopilot")
+                        CACHE_DIR = getattr(_web_autopilot_mod2, "CACHE_DIR", Path(".")) if _web_autopilot_mod2 else Path(".")
 
                         # Check both research cache AND code save dir for recently created files
                         files = glob.glob(str(CACHE_DIR / "*.*"))
@@ -755,7 +785,9 @@ async def websocket_endpoint(websocket: WebSocket, token: str = None, device: st
                             })
                             text_intercepted = True
                         else:
-                            from modules.web_autopilot import LAST_BOT_BYPASS_URL, clear_last_bot_bypass_url
+                            _wa_mod2 = registry.get_module("modules.web_autopilot")
+                            LAST_BOT_BYPASS_URL = getattr(_wa_mod2, "LAST_BOT_BYPASS_URL", None) if _wa_mod2 else None
+                            clear_last_bot_bypass_url = getattr(_wa_mod2, "clear_last_bot_bypass_url", lambda: None) if _wa_mod2 else lambda: None
                             if LAST_BOT_BYPASS_URL:
                                 logger.info(f"Text follow-up intercepted: Opening bot bypass URL: {LAST_BOT_BYPASS_URL}")
                                 await skills._skill_web_open(LAST_BOT_BYPASS_URL)
@@ -870,8 +902,11 @@ async def websocket_endpoint(websocket: WebSocket, token: str = None, device: st
                             f.write(base64.b64decode(image_data))
                             
                         # Tell the UI we are analyzing it
-                        from modules.llm import analyze_image_with_prompt
-                        vision_response = await analyze_image_with_prompt(str(temp_filepath), prompt)
+                        _analyze_img = registry.get_function("modules.llm", "analyze_image_with_prompt")
+                        if _analyze_img:
+                            vision_response = await _analyze_img(str(temp_filepath), prompt)
+                        else:
+                            vision_response = "Vision module is currently unavailable."
                         
                         # Send back the AI response
                         await websocket.send_json({
