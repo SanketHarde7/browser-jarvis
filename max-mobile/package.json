@@ -14,9 +14,11 @@
     "@capacitor/core": "^8.4.1",
     "@react-three/drei": "^10.7.7",
     "@react-three/fiber": "^9.6.1",
+    "@react-three/postprocessing": "^3.0.4",
     "@tailwindcss/vite": "^4.3.2",
     "framer-motion": "^12.42.2",
     "lucide-react": "^1.23.0",
+    "postprocessing": "^6.39.2",
     "react": "^19.2.7",
     "react-dom": "^19.2.7",
     "three": "^0.185.1"
