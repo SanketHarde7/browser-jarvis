@@ -57,11 +57,12 @@ SKILL_METADATA: Dict[str, Dict] = {
     # ── MEDIA & ENTERTAINMENT ──────────────────────────────────
     "media": {
         "triggers": ["pause", "play", "resume", "stop music", "next song", "previous", "skip",
-                      "roko", "chalao", "agla", "peeche", "gaana", "music", "media", "song"],
+                      "roko", "chalao", "agla", "peeche", "gaana", "media", "song"],
         "desc": "Control media playback (pause/play/next/previous/stop)",
         "example": "[SKILL:media:pause]",
         "cat": "media"
     },
+
     "youtube_play": {
         "triggers": ["play", "youtube", "video", "song", "gaana bajao", "play on youtube",
                       "youtube pe", "bajao", "sunao", "music video"],
@@ -555,9 +556,10 @@ SKILL_METADATA: Dict[str, Dict] = {
     # ── WHATSAPP ──────────────────────────────────────────────
     "whatsapp_message": {
         "triggers": ["whatsapp", "whatsapp message", "message bhejo", "whatsapp pe bhejo",
-                      "send message", "msg bhejo", "whatsapp send"],
+                      "send message", "msg bhejo", "whatsapp send", "send hello", "to me on whatsapp",
+                      "whatsapp me", "send text"],
         "desc": "Send a WhatsApp message to a contact",
-        "example": "[SKILL:whatsapp_message:Aditya:hello]",
+        "example": "[SKILL:whatsapp_message:me:hello]",
         "cat": "communication"
     },
     "whatsapp_screenshot": {
@@ -865,6 +867,7 @@ class SkillRAGMatcher:
             candidates = []
             for skill_name, score in sorted_skills:
                 meta = SKILL_METADATA[skill_name]
+                print(f"[DEBUG RAG L1] Skill: {skill_name} | Score: {score:.2f}")
                 candidates.append(SkillCandidate(
                     name=skill_name,
                     description=meta["desc"],
@@ -894,6 +897,7 @@ class SkillRAGMatcher:
             candidates = []
             for skill_name, score in sorted_skills:
                 meta = SKILL_METADATA[skill_name]
+                print(f"[DEBUG RAG L2] Fuzzy Skill: {skill_name} | Score: {score:.2f}")
                 candidates.append(SkillCandidate(
                     name=skill_name,
                     description=meta["desc"],
