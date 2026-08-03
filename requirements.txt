@@ -23,7 +23,7 @@ sentence-transformers>=2.7.0  # all-MiniLM-L6-v2 embeddings (~90MB one-time down
 pdfminer.six>=20231228        # PDF text extraction
 python-docx>=1.1.0            # DOCX text extraction
 Pillow>=10.0.0                # Image processing/OCR
-DOCX
+# codex-changes detail: remove invalid bare DOCX requirement; python-docx above is the maintained package used by the backend.
 
 # -- System info --             (NEW)
 psutil>=5.9.8                 # CPU, RAM, disk, battery, processes
@@ -34,6 +34,7 @@ keyboard>=0.13.5              # media keys (Windows/Linux) — run as admin on L
 # -- Browser automation --
 selenium>=4.15.0
 webdriver-manager>=4.0.0
+undetected-chromedriver>=3.5.5  # codex-changes detail: required by modules/agents/browser_manager.py
 
 # -- PC Control (optional) --
 pyautogui>=0.9.54             # mouse, keyboard, screenshot
@@ -41,6 +42,9 @@ pygetwindow>=0.0.9            # window listing (Windows)
 pyperclip>=1.8.0              # clipboard
 plyer>=2.1.0                  # desktop notifications (timer + reminders)
 pycaw>=20230407               # audio control
+numpy>=1.26.0                 # codex-changes detail: required by local Kokoro TTS audio assembly
+soundfile>=0.12.1             # codex-changes detail: required by local Kokoro TTS WAV output
+sounddevice>=0.4.6            # codex-changes detail: optional local voice playback backend
 
 # -- Windows-only PC control --
 pycaw>=20230407; platform_system == "Windows"  # volume control (Windows only)

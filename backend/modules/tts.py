@@ -10,8 +10,15 @@ import asyncio
 import logging
 import tempfile
 import threading
-import numpy as np
-import soundfile as sf
+# codex-changes detail: keep the TTS module importable when optional Kokoro audio dependencies are missing.
+try:
+    import numpy as np
+except ImportError:
+    np = None
+try:
+    import soundfile as sf
+except ImportError:
+    sf = None
 from pathlib import Path
 from config import config
 
@@ -47,6 +54,10 @@ class LocalVoiceEngine:
 
     def _init_engine(self):
         try:
+            # codex-changes detail: Kokoro needs numpy and soundfile for file generation, so do not mark the engine ready without them.
+            if np is None or sf is None:
+                missing = ", ".join(name for name, mod in {"numpy": np, "soundfile": sf}.items() if mod is None)
+                raise RuntimeError(f"Missing optional audio dependency/dependencies: {missing}")
             logger.info("🎙️ Initializing Local Voice Engine (Kokoro) in background...")
             from kokoro import KPipeline
             self.pipeline = KPipeline(lang_code='a')
@@ -67,8 +78,10 @@ async def generate_tts(text: str, voice: str = "", output_path: str = "") -> str
         logger.warning("TTS called with empty text, skipping.")
         return ""
 
+    # codex-changes detail: choose an output suffix based on the actually available local audio stack.
+    kokoro_ready = _engine.is_ready and _engine.pipeline and np is not None and sf is not None
     if not output_path:
-        tmp = tempfile.NamedTemporaryFile(suffix=".mp3" if not (_engine.is_ready and _engine.pipeline) else ".wav", delete=False)
+        tmp = tempfile.NamedTemporaryFile(suffix=".wav" if kokoro_ready else ".mp3", delete=False)
         output_path = tmp.name
         tmp.close()
 
@@ -82,7 +95,8 @@ async def generate_tts(text: str, voice: str = "", output_path: str = "") -> str
         return ""
 
     # Attempt Kokoro generation if engine is ready
-    if _engine.is_ready and _engine.pipeline:
+    # codex-changes detail: only run Kokoro when all optional runtime dependencies are available.
+    if kokoro_ready:
         async with _tts_lock:
             try:
                 chosen_voice = voice if voice else _engine.voice_name
@@ -139,7 +153,8 @@ async def generate_tts_paced(text: str, pause_seconds: float = 0.8, voice: str =
     """Generate TTS with natural pauses between lines (using numpy zero padding)."""
     if not text or not text.strip():
         return ""
-    if not _engine.is_ready or not _engine.pipeline:
+    # codex-changes detail: paced local generation requires numpy and soundfile; return cleanly if unavailable.
+    if not _engine.is_ready or not _engine.pipeline or np is None or sf is None:
         return ""
         
     try:
@@ -176,4 +191,4 @@ async def generate_tts_paced(text: str, pause_seconds: float = 0.8, voice: str =
     except Exception as e:
         logger.error(f"Kokoro Paced TTS failed: {e}")
         return ""
-
+

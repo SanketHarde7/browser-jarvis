@@ -1,5 +1,9 @@
 # Path: backend/modules/voice_engine.py
-import sounddevice as sd
+# codex-changes detail: make sounddevice optional so importing skills does not disable the whole backend on machines without audio drivers.
+try:
+    import sounddevice as sd
+except ImportError:
+    sd = None
 import os
 import threading
 import logging
@@ -46,6 +50,10 @@ class VoiceEngine:
             logger.error(f"❌ Failed to load Voice Engine: {e}")
 
     def speak(self, text: str):
+        # codex-changes detail: fail explicitly at playback time instead of import time when sounddevice is unavailable.
+        if sd is None:
+            logger.warning("sounddevice is not installed; skipping local voice playback.")
+            return
         if not self.is_ready or not self.pipeline:
             logger.warning("Voice engine is still loading or failed. Cannot speak yet.")
             return

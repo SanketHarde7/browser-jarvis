@@ -59,11 +59,12 @@ if _get_idle_seconds is None:
 
         _get_idle_seconds = _fallback_get_idle_seconds
         logger.info("Using pyautogui mouse fallback for idle detection.")
-    except ImportError:
+    # codex-changes detail: pyautogui can fail in headless Linux with KeyError('DISPLAY'), so catch all setup failures.
+    except Exception as e:
         def _get_idle_seconds_noop() -> float:
             return 0.0
         _get_idle_seconds = _get_idle_seconds_noop
-        logger.warning("No idle detection available (no ctypes or pyautogui).")
+        logger.warning(f"No idle detection available (ctypes/pyautogui setup failed): {e}")
 
 
 class HealthBuddy:

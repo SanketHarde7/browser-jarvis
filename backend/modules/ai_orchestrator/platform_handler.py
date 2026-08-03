@@ -6,7 +6,11 @@ import time
 import logging
 import platform as os_platform
 import pyperclip
-import undetected_chromedriver as uc
+# codex-changes detail: keep orchestrator platform handler importable without optional browser automation dependency.
+try:
+    import undetected_chromedriver as uc
+except ImportError:
+    uc = None
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
@@ -25,6 +29,9 @@ class AIOrchestratorDriver:
 
     @classmethod
     def get_driver(cls, profile_path: str = None, binary_path: str = None):
+        # codex-changes detail: fail at browser-use time with an actionable dependency message.
+        if uc is None:
+            raise RuntimeError("undetected-chromedriver is not installed; AI platform browser automation is unavailable.")
         if cls._instance is None:
             cls._profile_path = profile_path
             cls._binary_path = binary_path

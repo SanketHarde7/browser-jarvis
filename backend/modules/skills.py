@@ -29,7 +29,10 @@ logger = logging.getLogger("MAX.SKILLS")
 try:
     import pyautogui
     PYAUTOGUI_AVAILABLE = True
-except ImportError:
+except Exception as e:
+    # codex-changes detail: pyautogui can raise DISPLAY-related errors in headless environments; keep non-GUI skills available.
+    logger.warning(f"pyautogui unavailable; GUI automation skills disabled: {e}")
+    pyautogui = None
     PYAUTOGUI_AVAILABLE = False
 
 try:
