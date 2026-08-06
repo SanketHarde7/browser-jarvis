@@ -99,7 +99,7 @@ HealthBuddy = registry.get_function("modules.health_buddy", "HealthBuddy", fallb
 # ── Global WebSocket & Health Buddy References ──
 active_websocket: Optional[WebSocket] = None
 main_loop: Optional[asyncio.AbstractEventLoop] = None
-health_buddy_instance: Optional[HealthBuddy] = None
+health_buddy_instance: Optional[Any] = None
 
 # ═══════════════════════════════════════════════════
 # LOGGING
