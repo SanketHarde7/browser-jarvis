@@ -678,7 +678,51 @@ class MaxAgent:
         final_response = llm_response
         if skill_tag:
             print(f" [TRACKER: 10] Executing Skill: {skill_tag}")
-            skill_result = await self.skills.parse_and_execute(skill_tag, combined_context, text)
+            
+            # --- MODULAR SKILL PIPELINE ---
+            try:
+                # Parse [SKILL:name:args...]
+                tag_inner = skill_tag.strip("[]")
+                parts = tag_inner.split(":")
+                if len(parts) >= 2 and parts[0] == "SKILL":
+                    skill_name = parts[1]
+                    skill_args = parts[2:]
+                    
+                    # Discover skills if not already done (lazy load safety)
+                    if not registry.list_skills():
+                        registry.discover_skills("skills.core_skills")
+                        
+                    modular_skill = registry.get_skill(skill_name)
+                    if modular_skill:
+                        print(f" [TRACKER: MODULAR PIPELINE] Running {skill_name}")
+                        try:
+                            # BaseSkill execution
+                            modular_output = modular_skill.execute(*skill_args)
+                            
+                            # Mock the old skill_result format for compatibility downstream
+                            skill_result = {
+                                "executed": True,
+                                "result": modular_output,
+                                "skill_name": skill_name,
+                                "is_data_skill": False 
+                            }
+                        except Exception as e:
+                            logger.error(f"Modular skill {skill_name} failed: {e}")
+                            skill_result = {
+                                "executed": False,
+                                "error": str(e),
+                                "skill_name": skill_name
+                            }
+                    else:
+                        # Fallback to monolithic skills engine
+                        skill_result = await self.skills.parse_and_execute(skill_tag, combined_context, text)
+                else:
+                    skill_result = await self.skills.parse_and_execute(skill_tag, combined_context, text)
+            except Exception as e:
+                logger.error(f"Modular skill routing failed: {e}")
+                skill_result = await self.skills.parse_and_execute(skill_tag, combined_context, text)
+            # ------------------------------
+            
             if skill_result.get("executed"):
                 skill_output = skill_result.get("result", "").strip()
                 skill_failed = any(ind in skill_output.lower() for ind in ["could not find", "failed", "error", "not found", "not installed", "needed:", "missing", "unable to", "cannot", "does not exist", "no such"])

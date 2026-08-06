@@ -73,9 +73,47 @@ class ModuleRegistry:
         return report
 
     @classmethod
-    def is_available(cls, module_path: str) -> bool:
-        """Quick check if a module loaded successfully."""
-        return module_path in cls._modules and cls._modules[module_path] is not _FAILED
+    def register_skill(cls, skill_instance: Any):
+        """Register a BaseSkill instance."""
+        if not hasattr(cls, '_skills'):
+            cls._skills = {}
+        cls._skills[skill_instance.name] = skill_instance
+        logger.info(f"✅ Registered skill: {skill_instance.name}")
+
+    @classmethod
+    def get_skill(cls, skill_name: str) -> Optional[Any]:
+        """Retrieve a registered skill by name."""
+        if not hasattr(cls, '_skills'):
+            return None
+        return cls._skills.get(skill_name)
+
+    @classmethod
+    def list_skills(cls) -> Dict[str, Any]:
+        """List all registered skills."""
+        if not hasattr(cls, '_skills'):
+            return {}
+        return dict(cls._skills)
+
+    @classmethod
+    def discover_skills(cls, module_path: str):
+        """Discover and register all BaseSkill subclasses from a module."""
+        module = cls.get_module(module_path)
+        if not module or module is _FAILED:
+            return
+
+        import inspect
+        from skills.base_skill import BaseSkill
+        
+        for name, obj in inspect.getmembers(module):
+            if inspect.isclass(obj) and issubclass(obj, BaseSkill) and obj is not BaseSkill:
+                try:
+                    skill_instance = obj()
+                    cls.register_skill(skill_instance)
+                except Exception as e:
+                    logger.error(f"❌ Failed to instantiate skill {name} from {module_path}: {e}")
 
 registry = ModuleRegistry()
+
+# Auto-discover core skills
+registry.discover_skills("skills.core_skills")
 

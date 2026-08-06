@@ -53,6 +53,10 @@ import uvicorn
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
+# ── Ensure backend is also in path ──
+BACKEND_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(BACKEND_DIR))
+
 from config import config
 from agent_core import get_agent, register_websocket
 from core.module_registry import registry
@@ -109,7 +113,7 @@ logging.basicConfig(
 logger = logging.getLogger("MAX.API")
 
 def send_health_buddy_alert(payload):
-    from agent_core import get_active_websockets, get_main_loop
+    from agent_core import get_active_websockets, get_main_loop, unregister_websocket
     ws_list = get_active_websockets()
     loop = get_main_loop()
     if ws_list and loop:
@@ -119,6 +123,10 @@ def send_health_buddy_alert(payload):
                     await ws.send_json(payload)
                 except Exception as e:
                     logger.warning(f"Failed to stream health alert: {e}")
+                    try:
+                        unregister_websocket(ws)
+                    except Exception:
+                        pass
         asyncio.run_coroutine_threadsafe(_send(), loop)
 
 # ═══════════════════════════════════════════════════
