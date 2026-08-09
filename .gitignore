@@ -83,6 +83,7 @@ secrets/
 # ═══════════════════════════════════════════
 backend/data/
 backend/backend/data/
+backend/data/contacts.json
 backend/data/memory.json
 backend/data/jarvis_config.json
 skill_forge_log.jsonl
