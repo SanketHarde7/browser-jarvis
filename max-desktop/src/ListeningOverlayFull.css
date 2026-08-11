@@ -171,9 +171,39 @@ body {
 /* ══════════════════════════════════════════════════════════════ */
 /* IDLE THEME (Random Monochromatic Family with Chemical Mix) */
 
+@keyframes gasPulseSolid {
+  0% {
+    filter: blur(3px) brightness(0.85);
+  }
+  100% {
+    filter: blur(6px) brightness(1.15);
+  }
+}
+
 .theme-idle-layer {
-  /* Use the same gas flow animation as others */
-  animation: gasFlowHorizontal 10s linear infinite, gasPulse 6s cubic-bezier(0.4, 0, 0.2, 1) infinite alternate;
+  /* Use solid pulse to maintain 100% opacity, preventing underlying layers from flashing when unmounted */
+  animation: gasFlowHorizontal 10s linear infinite, gasPulseSolid 6s cubic-bezier(0.4, 0, 0.2, 1) infinite alternate !important;
+}
+
+/* Wrapper to prevent opacity animation conflicts */
+.layer-wrapper {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+/* Breathing opacity fade for dynamic gradient changes */
+.fade-in-breathing {
+  animation: breathingFadeIn 3.5s ease-in-out forwards;
+}
+
+@keyframes breathingFadeIn {
+  0% {
+    opacity: 0;
+  }
+  100% {
+    opacity: 1;
+  }
 }
 
 /* Chemical mixing mask animation for right-to-left smooth transition */
