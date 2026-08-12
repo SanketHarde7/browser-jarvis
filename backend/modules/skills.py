@@ -199,6 +199,9 @@ class SkillsEngine:
         self._plugin_loader  = None
         self._app_indexer    = None
         self._pending_links  = []
+        # ── Pending system action timers (shutdown/restart/lock) ──
+        self._pending_system_actions: Dict[str, threading.Timer] = {}
+        self._system_action_lock = threading.Lock()
         self.skills_registry = self._register_skills()
         self._load_plugins()
         self.scheduler = ActionScheduler(self.config, self)
@@ -344,6 +347,10 @@ class SkillsEngine:
             "lock_pc":           self._skill_lock_pc,
             "system_shutdown":   self._skill_system_shutdown,
             "system_restart":    self._skill_system_restart,
+            "cancel_shutdown":   self._skill_cancel_shutdown,
+            "cancel_restart":    self._skill_cancel_restart,
+            "cancel_lock":       self._skill_cancel_lock,
+            "repeat_last":       self._skill_repeat_last,
             "whatsapp_message":  self._skill_whatsapp_message,
             "whatsapp_screenshot": self._skill_whatsapp_screenshot,
             "type_text":         self._skill_type_text,
@@ -408,7 +415,8 @@ class SkillsEngine:
             import importlib
             import pkgutil
             import inspect
-            from skills.base_skill import BaseSkill
+            # pyrefly: ignore [missing-import]
+            from backend.skills.base_skill import BaseSkill
             import skills
 
             for loader, module_name, is_pkg in pkgutil.iter_modules(skills.__path__):
@@ -532,7 +540,7 @@ class SkillsEngine:
                 blocked_mobile_skills = {"orchestrator", "deep_research"}
                 if skill_name in blocked_mobile_skills:
                     logger.warning(f"Blocked skill execution on phone: {skill_name}")
-                    return {"success": False, "result": "Deep research and orchestrator tasks are restricted on mobile.", "tts_text": "I cannot do deep research from the phone."}
+                    return "❌ Deep research and orchestrator tasks are restricted on mobile.", skill_name, False
 
             if skill_name not in self.skills_registry:
                 logger.warning(f"Unknown skill: {skill_name}")
@@ -1749,7 +1757,57 @@ class SkillsEngine:
         except Exception as e:
             return f"Clipboard error: {str(e)[:120]}"
 
-    def _skill_lock_pc(self, *args) -> str:
+    # ══════════════════════════════════════════════════════
+    # SYSTEM ACTION SCHEDULING HELPERS
+    # ══════════════════════════════════════════════════════
+
+    def _schedule_system_action(self, action_type: str, delay_secs: int, execute_fn) -> str:
+        """
+        Schedule a system action (shutdown/restart/lock) with a delay.
+        Uses threading.Timer for precise timing + easy cancellation.
+        """
+        with self._system_action_lock:
+            # Cancel any existing pending action of same type
+            if action_type in self._pending_system_actions:
+                self._pending_system_actions[action_type].cancel()
+                del self._pending_system_actions[action_type]
+
+            timer = threading.Timer(delay_secs, execute_fn)
+            timer.daemon = True
+            timer.start()
+            self._pending_system_actions[action_type] = timer
+
+        if delay_secs >= 3600:
+            time_str = f"{delay_secs // 3600} hour{'s' if delay_secs >= 7200 else ''}"
+        elif delay_secs >= 60:
+            time_str = f"{delay_secs // 60} minute{'s' if delay_secs >= 120 else ''}"
+        else:
+            time_str = f"{delay_secs} second{'s' if delay_secs != 1 else ''}"
+
+        action_label = action_type.replace('_', ' ')
+        return f"Got it. {action_label.title()} scheduled in {time_str}. Say 'cancel {action_label}' to stop it."
+
+    def _cancel_system_action(self, action_type: str) -> str:
+        """Cancel a pending scheduled system action."""
+        with self._system_action_lock:
+            timer = self._pending_system_actions.pop(action_type, None)
+
+        if timer:
+            timer.cancel()
+            action_label = action_type.replace('_', ' ')
+            # Also abort any OS-level pending shutdown/restart
+            if action_type in ("shutdown", "restart") and platform.system() == "Windows":
+                try:
+                    subprocess.run(["shutdown", "/a"], capture_output=True)
+                except Exception:
+                    pass
+            return f"{action_label.title()} cancelled."
+        else:
+            action_label = action_type.replace('_', ' ')
+            return f"No pending {action_label} to cancel."
+
+    def _execute_lock_now(self):
+        """Actually lock the PC. Called by timer or directly."""
         try:
             system = platform.system()
             if system == "Windows":
@@ -1758,9 +1816,52 @@ class SkillsEngine:
                 subprocess.run(["/System/Library/CoreServices/Menu Extras/User.menu/Contents/Resources/CGSession", "-suspend"])
             else:
                 subprocess.run(["gnome-screensaver-command", "-l"])
-            return "PC locked."
         except Exception as e:
-            return f"Lock failed: {str(e)[:120]}"
+            logger.error(f"Lock execution failed: {e}")
+        finally:
+            with self._system_action_lock:
+                self._pending_system_actions.pop("lock", None)
+
+    def _execute_shutdown_now(self):
+        """Actually shutdown the PC. Called by timer or directly."""
+        try:
+            if platform.system() == "Windows":
+                subprocess.run(["shutdown", "/s", "/t", "0"], check=True)
+            else:
+                subprocess.run(["sudo", "shutdown", "-h", "now"], check=True)
+        except Exception as e:
+            logger.error(f"Shutdown execution failed: {e}")
+        finally:
+            with self._system_action_lock:
+                self._pending_system_actions.pop("shutdown", None)
+
+    def _execute_restart_now(self):
+        """Actually restart the PC. Called by timer or directly."""
+        try:
+            if platform.system() == "Windows":
+                subprocess.run(["shutdown", "/r", "/t", "0"], check=True)
+            else:
+                subprocess.run(["sudo", "shutdown", "-r", "now"], check=True)
+        except Exception as e:
+            logger.error(f"Restart execution failed: {e}")
+        finally:
+            with self._system_action_lock:
+                self._pending_system_actions.pop("restart", None)
+
+    # ══════════════════════════════════════════════════════
+    # SYSTEM SKILLS (with scheduling support)
+    # ══════════════════════════════════════════════════════
+
+    def _skill_lock_pc(self, delay: str = "0", *args) -> str:
+        try:
+            secs = max(0, int(delay))
+        except (ValueError, TypeError):
+            secs = 0
+        if secs >= 10:
+            return self._schedule_system_action("lock", secs, self._execute_lock_now)
+        else:
+            self._execute_lock_now()
+            return "PC locked."
     
     async def _skill_youtube_play(self, *args) -> str:
         query = " ".join(args).strip()
@@ -1972,41 +2073,36 @@ class SkillsEngine:
             return "❌ Low network speed or offline: Cannot connect to WhatsApp Web right now. Please check your internet connection."
 
         try:
-            import webbrowser
             from urllib.parse import quote
             import pyautogui
 
-            # 3. Check if WhatsApp window is ALREADY open
-            existing_win, already_open = self._focus_whatsapp_window()
+            # 3. Open WhatsApp Desktop App via protocol handler
+            url = f"whatsapp://send?phone={phone_num}&text={quote(actual_message)}"
+            logger.info(f"Opening WhatsApp Desktop App: {url}")
+            
+            if platform.system() == "Windows":
+                os.startfile(url)
+            elif platform.system() == "Darwin":
+                subprocess.run(["open", url])
+            else:
+                subprocess.run(["xdg-open", url])
 
-            # 4. Open WhatsApp URL (always needed – the URL carries the message text)
-            url = f"https://web.whatsapp.com/send?phone={phone_num}&text={quote(actual_message)}"
-            logger.info(f"Opening WhatsApp URL (already_open={already_open}): {url}")
-            webbrowser.open(url)
-
-            # 5. Wait for chat panel to load
-            wait_seconds = 5.0 if already_open else 13.0
-            logger.info(f"Waiting {wait_seconds}s for WhatsApp Web chat panel...")
+            # 4. Wait for the app to launch and render the chat
+            # Native apps are fast, 2.5s is usually enough even from a cold start
+            wait_seconds = 2.5
+            logger.info(f"Waiting {wait_seconds}s for WhatsApp Desktop to foreground...")
             time.sleep(wait_seconds)
 
-            # 6. Re-focus the WhatsApp window after URL load
-            focused_win, _ = self._focus_whatsapp_window()
-            if not focused_win:
-                logger.warning("WhatsApp window not found after opening URL – trying to proceed anyway.")
-                time.sleep(2.0)
-
-            # 7. Press Enter to send message
+            # 5. Press Enter to send message
+            # The app naturally forces itself to the foreground, so we just press enter
             logger.info("Pressing Enter to send message...")
             pyautogui.press("enter")
             
-            # Wait for transmission
-            time.sleep(3.5)
-
-            # Close tab cleanly
-            pyautogui.hotkey("ctrl", "w")
+            # Wait a moment for transmission
+            time.sleep(1.0)
             
             contact_label = contact.title() if contact else phone_num
-            return f"✅ WhatsApp message successfully sent to {contact_label} ({phone_num})."
+            return f"✅ WhatsApp message successfully sent to {contact_label} ({phone_num}) via Desktop App."
 
         except Exception as e:
             return f"❌ WhatsApp execution error: {e}"
@@ -2041,68 +2137,51 @@ class SkillsEngine:
                 logger.error(f"Failed to copy image to clipboard: {ps_err}")
                 return False
 
-    def _attempt_send_screenshot(self, phone_num: str, fp: Path, already_open: bool) -> bool:
-        """Helper to paste and send an existing screenshot file to WhatsApp Web tab."""
+    def _attempt_send_screenshot(self, phone_num: str, fp: Path) -> bool:
+        """Helper to paste and send an existing screenshot file to WhatsApp Desktop."""
         import pyautogui
-        import webbrowser
 
         # 1. Place image in Windows Clipboard
         if not self._copy_image_to_clipboard(fp):
             logger.error("Clipboard copy failed.")
             return False
 
-        # 2. Open WhatsApp chat URL
-        url = f"https://web.whatsapp.com/send?phone={phone_num}"
-        logger.info(f"Opening WhatsApp URL: {url}")
-        webbrowser.open(url)
+        # 2. Open WhatsApp Desktop App via protocol handler
+        url = f"whatsapp://send?phone={phone_num}"
+        logger.info(f"Opening WhatsApp Desktop App for screenshot: {url}")
+        
+        if platform.system() == "Windows":
+            os.startfile(url)
+        elif platform.system() == "Darwin":
+            subprocess.run(["open", url])
+        else:
+            subprocess.run(["xdg-open", url])
 
-        # 3. Wait for chat DOM to fully render
-        wait_seconds = 5.0 if already_open else 12.0
-        logger.info(f"Waiting {wait_seconds}s for WhatsApp Web chat panel to load...")
+        # 3. Wait for the app to foreground and load chat
+        wait_seconds = 2.5
+        logger.info(f"Waiting {wait_seconds}s for WhatsApp Desktop to foreground...")
         time.sleep(wait_seconds)
 
-        # 4. Focus WhatsApp window using centralized helper (handles Opera, minimize/restore, etc.)
-        wa_win, _ = self._focus_whatsapp_window()
-        if not wa_win:
-            # Last resort: wait a bit more and try once more
-            logger.warning("WhatsApp window not detected, waiting 5s extra...")
-            time.sleep(5.0)
-            wa_win, _ = self._focus_whatsapp_window()
-            if not wa_win:
-                logger.error("WhatsApp browser window was not found or could not be activated.")
-                return False
-
-        # 5. Paste screenshot image (Ctrl+V) – with retry if first paste doesn't trigger preview
+        # 4. Paste screenshot image (Ctrl+V)
         for paste_attempt in range(2):
             logger.info(f"Pasting screenshot via Ctrl+V (attempt {paste_attempt + 1})...")
-            # Re-load clipboard before each paste attempt (ensures clipboard is fresh)
             if paste_attempt > 0:
                 self._copy_image_to_clipboard(fp)
-                time.sleep(0.5)
-                # Re-focus window before retry paste
-                self._focus_whatsapp_window()
                 time.sleep(0.5)
 
             pyautogui.hotkey("ctrl", "v")
 
-            # 6. Wait for WhatsApp media preview dialog to appear
-            # This dialog takes 3-5s to fully render (shows image preview + send button)
-            time.sleep(4.0)
+            # 5. Wait for WhatsApp media preview dialog to appear
+            time.sleep(1.5)
 
-            # 7. Press Enter to confirm send
+            # 6. Press Enter to confirm send
             logger.info("Pressing Enter to send screenshot...")
             pyautogui.press("enter")
 
-            # 8. Wait for media upload transmission
-            time.sleep(5.0)
+            # 7. Wait for media upload transmission
+            time.sleep(1.5)
+            break
 
-            # Check if the media preview dialog consumed the Enter (success indicator):
-            # If we're still on the page after 5s, likely it went through
-            # Note: there's no reliable programmatic check here, so we trust timing
-            break  # Single attempt if paste goes through
-
-        # 9. Close tab
-        pyautogui.hotkey("ctrl", "w")
         return True
 
     def _skill_whatsapp_screenshot(self, contact: str = "", **kw) -> str:
@@ -2129,19 +2208,15 @@ class SkillsEngine:
         except Exception as ss_err:
             return f"❌ Screenshot capture failed: {ss_err}"
 
-        # Check if WhatsApp window is ALREADY open using centralized helper
-        _, already_open = self._focus_whatsapp_window()
-
         # Attempt 1: Send screenshot
-        logger.info("Attempt 1: Sending screenshot to WhatsApp...")
-        success = self._attempt_send_screenshot(phone_num, fp, already_open)
+        logger.info("Attempt 1: Sending screenshot to WhatsApp Desktop...")
+        success = self._attempt_send_screenshot(phone_num, fp)
 
         # Fail Case: If Attempt 1 fails, RETRY using SAME screenshot (no new capture!)
         if not success:
             logger.warning("Attempt 1 failed! Retrying with SAME captured screenshot...")
-            time.sleep(3.0)
-            _, already_open = self._focus_whatsapp_window()
-            success = self._attempt_send_screenshot(phone_num, fp, already_open)
+            time.sleep(1.0)
+            success = self._attempt_send_screenshot(phone_num, fp)
 
         contact_label = contact.title() if contact else phone_num
 
@@ -2174,27 +2249,68 @@ class SkillsEngine:
         except Exception as e:
             return f"Key press failed: {e}"
 
-    def _skill_system_shutdown(self, delay: str = "30", **kw) -> str:
+    def _skill_system_shutdown(self, delay: str = "0", **kw) -> str:
         try:
             secs = max(0, int(delay))
-            if platform.system() == "Windows": 
-                subprocess.run(["shutdown", "/s", "/t", str(secs)], check=True)
-            else: 
-                subprocess.run(["sudo", "shutdown", "-h", f"+{max(1,secs//60)}"], check=True)
-            return f"Shutting down in {secs}s. Save your work."
-        except Exception as e: 
-            return f"Shutdown failed: {e}"
+        except (ValueError, TypeError):
+            secs = 30
+        if secs >= 60:
+            return self._schedule_system_action("shutdown", secs, self._execute_shutdown_now)
+        else:
+            self._execute_shutdown_now()
+            return f"Shutting down now. Save your work."
 
-    def _skill_system_restart(self, delay: str = "30", **kw) -> str:
+    def _skill_system_restart(self, delay: str = "0", **kw) -> str:
         try:
             secs = max(0, int(delay))
-            if platform.system() == "Windows": 
-                subprocess.run(["shutdown", "/r", "/t", str(secs)], check=True)
-            else: 
-                subprocess.run(["sudo", "shutdown", "-r", f"+{max(1,secs//60)}"], check=True)
-            return f"Restarting in {secs}s."
-        except Exception as e: 
-            return f"Restart failed: {e}"
+        except (ValueError, TypeError):
+            secs = 30
+        if secs >= 60:
+            return self._schedule_system_action("restart", secs, self._execute_restart_now)
+        else:
+            self._execute_restart_now()
+            return f"Restarting now."
+
+    # ── Cancel Skills ──────────────────────────────────────────
+
+    def _skill_cancel_shutdown(self, *args) -> str:
+        result = self._cancel_system_action("shutdown")
+        # Also abort any OS-level pending shutdown (e.g., from shutdown /s /t)
+        if platform.system() == "Windows":
+            try:
+                subprocess.run(["shutdown", "/a"], capture_output=True)
+            except Exception:
+                pass
+        return result
+
+    def _skill_cancel_restart(self, *args) -> str:
+        result = self._cancel_system_action("restart")
+        if platform.system() == "Windows":
+            try:
+                subprocess.run(["shutdown", "/a"], capture_output=True)
+            except Exception:
+                pass
+        return result
+
+    def _skill_cancel_lock(self, *args) -> str:
+        return self._cancel_system_action("lock")
+
+    def _skill_repeat_last(self, *args) -> str:
+        """Repeat the last spoken or generated response."""
+        last_msg = ""
+        if hasattr(self, "agent_ref") and getattr(self.agent_ref, "last_assistant_response", None):
+            last_msg = self.agent_ref.last_assistant_response
+        if not last_msg:
+            try:
+                from modules.memory import get_memory
+                mem = get_memory()
+                history = mem.get_short_term_history(limit=4)
+                for msg in reversed(history):
+                    if msg.get("role") == "assistant" and msg.get("content"):
+                        last_msg = msg.get("content")
+                        break
+            except Exception: pass
+        return last_msg or "I haven't said anything yet."
 
     def _skill_email_send(self, to="", subject="", body=""): 
         return self.email_agent.send_email(to, subject, body)
@@ -2892,20 +3008,71 @@ Rules:
         success, msg = fm.move_file(query, dest)
         return msg
 
+    def _copy_file_to_clipboard(self, file_path: Path) -> bool:
+        """Copies a generic file to the Windows Clipboard (like Ctrl+C in Explorer)."""
+        try:
+            # Set-Clipboard -Path copies the file object so it can be pasted into apps like WhatsApp
+            ps_script = f"Set-Clipboard -Path '{str(file_path.absolute())}'"
+            subprocess.run(["powershell", "-Sta", "-Command", ps_script], creationflags=0x08000000, check=True)
+            return True
+        except Exception as e:
+            logger.error(f"Failed to copy file to clipboard: {e}")
+            return False
+
     async def _skill_file_send_whatsapp(self, *args) -> str:
-        """Locate file and trigger WhatsApp attachment pipeline."""
+        """Locate file and trigger WhatsApp Desktop attachment pipeline."""
         raw = " ".join(args).strip()
         parts = [p.strip() for p in raw.split("|") if p.strip()]
         query = parts[0] if parts else raw
         recipient = parts[1] if len(parts) > 1 else ""
+
+        if not recipient:
+            return "❌ Target contact is required to send a file automatically via WhatsApp."
+
+        phone_num, err = self._resolve_contact_number(recipient)
+        if err:
+            return err
+
         from modules.file_manager import get_file_manager
         fm = get_file_manager()
         success, msg, file_path = fm.find_file(query)
         if not success or not file_path:
-            return f"WhatsApp send failed: {msg}"
+            return f"❌ WhatsApp send failed: {msg}"
         
-        web_res = await self._skill_web_open("whatsapp.com")
-        return f"File '{file_path.name}' found at '{file_path}'. Opened WhatsApp. Target contact: '{recipient or 'Current Chat'}'."
+        # 1. Copy file to clipboard
+        if not self._copy_file_to_clipboard(file_path):
+            return "❌ Failed to copy file to clipboard."
+
+        # 2. Open WhatsApp Desktop App via protocol handler
+        url = f"whatsapp://send?phone={phone_num}"
+        logger.info(f"Opening WhatsApp Desktop App to send file: {url}")
+        
+        if platform.system() == "Windows":
+            os.startfile(url)
+        elif platform.system() == "Darwin":
+            subprocess.run(["open", url])
+        else:
+            subprocess.run(["xdg-open", url])
+
+        # 3. Wait for app to foreground
+        import pyautogui
+        await asyncio.sleep(2.5)
+
+        # 4. Paste file (Ctrl+V)
+        logger.info("Pasting file via Ctrl+V...")
+        pyautogui.hotkey("ctrl", "v")
+        
+        # 5. Wait for preview dialog
+        await asyncio.sleep(1.5)
+
+        # 6. Press enter to send
+        logger.info("Pressing Enter to send file...")
+        pyautogui.press("enter")
+        
+        await asyncio.sleep(1.5)
+        
+        contact_label = recipient.title()
+        return f"✅ File '{file_path.name}' successfully attached and sent to {contact_label} ({phone_num}) via WhatsApp Desktop."
 
     async def _skill_file_upload_browser(self, *args) -> str:
         """Locate file and trigger browser upload + dictation pipeline."""
@@ -2942,8 +3109,14 @@ Rules:
         from modules.file_manager import get_file_manager
         fm = get_file_manager()
         success, summary, files = fm.list_files_by_relative_date(folder, days_ago)
-        web_res = await self._skill_web_open("whatsapp.com")
-        return f"Document summary generated: '{summary}'. Opened WhatsApp for contact '{recipient or 'Current Chat'}'."
+        
+        if recipient:
+            return self._skill_whatsapp_message(recipient, summary)
+        else:
+            from urllib.parse import quote
+            url = f"whatsapp://send?text={quote(summary)}"
+            if platform.system() == "Windows": os.startfile(url)
+            return f"Document summary generated: '{summary}'. Opened WhatsApp Desktop."
 
     async def _skill_folder_screenshot_whatsapp(self, *args) -> str:
         """Open target folder window, capture screenshot, and send via WhatsApp."""
@@ -2959,9 +3132,11 @@ Rules:
         else:
             os.system(f'explorer "{folder_path}"')
         await asyncio.sleep(1.2)
-        ss_res = await self._skill_read_screen("current")
-        web_res = await self._skill_web_open("whatsapp.com")
-        return f"Captured screenshot of folder '{folder_path.name}'. Opened WhatsApp for '{recipient or 'Current Chat'}'."
+        
+        if recipient:
+            return self._skill_whatsapp_screenshot(recipient)
+        else:
+            return "❌ Target contact is required to send a folder screenshot automatically via WhatsApp."
 
     async def _skill_vscode_git_push(self, *args) -> str:
         """Open VS Code, open terminal, and auto-push files to GitHub."""
