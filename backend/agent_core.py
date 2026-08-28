@@ -209,6 +209,13 @@ class MaxAgent:
         
         self.config = config
         self.memory = get_memory_manager(config)
+        # Ensure all memory tiers are loaded from disk at startup.
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                asyncio.create_task(self.memory.initialize())
+        except Exception:
+            pass
         self.skills = get_skills_engine(config)
         self.gatekeeper = get_gatekeeper()
         self.intent_engine = get_intent_engine(config)
@@ -533,6 +540,8 @@ class MaxAgent:
         try: await self.memory.extract_and_store_facts(text)
         except Exception: pass
 
+        # Use the lightweight working-context here. The token-budgeted,
+        # intent-aware context is built in stage 5 once we know the intent.
         memory_context = self.memory.get_context()
 
         print("[TRACKER: 6] Getting KB Context...")
@@ -616,7 +625,7 @@ class MaxAgent:
                 raw_response = chat_result["response"]
                 filtered_response = self.gatekeeper.filter(raw_response)
                 self.last_assistant_response = filtered_response
-                
+
                 # Generate TTS and save to memory
                 tts_path = ""
                 if use_tts and filtered_response:
@@ -628,9 +637,9 @@ class MaxAgent:
                                 asyncio.create_task(self._stream_remaining_tts(chunks[1:], self.current_stream_task_id))
                         except Exception as e:
                             print(f" [TRACKER: ERROR] TTS chunk 1 Crashed: {e}")
-                
+
+                # add_message now debounces; no need for explicit save_memory().
                 await self.memory.add_message("assistant", filtered_response)
-                await self.memory.save_memory()
                 return {"response": filtered_response, "tts_path": tts_path, "skill_used": None, "intent": "general_chat"}
             except Exception as e:
                 logger.error(f"ChatAgent failed: {e}. Falling back to legacy_engine.")
@@ -652,8 +661,8 @@ class MaxAgent:
 
                 loop_result = await get_agent_loop(self.config, self.skills).run(text, combined_context, self._send_event_via_websocket)
                 final_response = self.gatekeeper.filter(loop_result["response"])
+                # add_message now debounces the disk write.
                 await self.memory.add_message("assistant", final_response)
-                await self.memory.save_memory()
 
                 tts_path = ""
                 if use_tts and final_response:
@@ -679,8 +688,15 @@ class MaxAgent:
             except Exception: pass
 
         try:
+            # Replace the legacy working-memory block with the token-budgeted,
+            # intent-aware context. Keeps KB prefix when present, drops the
+            # earlier full memory dump to avoid double-injection.
             smart_context = self.memory.get_context_for_query(text, intent.type.value)
-            combined_context = (combined_context.split('\n\n')[0] + "\n\n" + smart_context) if "\n\n" in combined_context else smart_context
+            if "\n\n" in combined_context:
+                kb_prefix_part = combined_context.split("\n\n", 1)[0]
+                combined_context = f"{kb_prefix_part}\n\n{smart_context}" if smart_context else kb_prefix_part
+            else:
+                combined_context = smart_context
         except Exception as e:
             logger.warning(f"Smart memory failed: {e}")
 
@@ -788,11 +804,15 @@ class MaxAgent:
         except Exception: pass
 
         await self.memory.add_message("assistant", filtered)
-        await self.memory.save_memory()
+        # Persist the episode for future recall. Memory tier is debounced.
+        try:
+            await self.memory.store_episode(text, filtered, skill_tag or "")
+        except Exception: pass
 
         try:
             get_learning_engine().record_interaction(text, filtered, skill_tag or "")
-            await self.memory.store_episode(text, filtered, skill_tag or "")
+            if skill_tag:
+                await self.memory.record_skill_success(skill_tag, text)
         except Exception: pass
 
         tts_path = ""
