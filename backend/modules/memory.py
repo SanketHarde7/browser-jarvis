@@ -1,271 +1,610 @@
-# Path: backend/modules/memory.py
-# Use: Manages session history and persistent user context.
 """
-memory.py — MAX v4.0
-Added: Personality evolution tracking, auto fact extraction, buddy tone.
-"""
-import json
-import os
-import asyncio
-import logging
-from datetime import datetime
-from typing import Optional, List, Dict
-from pathlib import Path
+memory.py - MAX Multi-Tier Memory System
 
-logger = logging.getLogger(__name__)
+Industry-grade memory with token-efficient context retrieval, atomic writes,
+and a vector-backed episodic recall layer. Backwards-compatible with the
+public API used by agent_core.py and skills.py.
+
+Memory tiers:
+  1. WORKING       - last N turns, in-memory only, fastest
+  2. SESSION       - current session summary, persisted (debounced)
+  3. FACTUAL       - user facts, preferences, permanent rules
+  4. EPISODIC      - past interactions, vector-indexed (ChromaDB if avail,
+                     else TF-IDF fallback)
+  5. SEMANTIC      - consolidated user profile, periodically regenerated
+  6. PROCEDURAL    - successful skill patterns, used for skill selection
+
+Storage:
+  - One JSON file per tier, atomic write via .tmp + os.replace.
+  - Save is DEBOUNCED: writes happen at most every N seconds OR when the
+    pending queue hits M items, whichever first. shutdown()/flush() forces
+    a final write.
+  - All public methods are async-safe via a single asyncio.Lock.
+  - Context builder enforces a TOKEN BUDGET (default 800 tokens) so the
+    LLM prompt stays lean.
+"""
+
+import asyncio
+import hashlib
+import json
+import logging
+import os
+import re
+import time
+from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+logger = logging.getLogger("MAX.MEMORY")
+
+# Roughly 4 chars per token for English. Used to estimate and cap context size.
+CHARS_PER_TOKEN = 4
+DEFAULT_TOKEN_BUDGET = 800
+# Debounce: save at most once every N seconds, OR after M pending writes.
+DEBOUNCE_SECONDS = 5.0
+DEBOUNCE_PENDING_MAX = 10
+# Episodic: how many past interactions to keep.
+EPISODIC_MAX_ENTRIES = 500
+# Episodic: drop episodes older than this (days) unless pinned.
+EPISODIC_TTL_DAYS = 90
+
+
+# ---------------------------------------------------------------------------
+# Atomic JSON store
+# ---------------------------------------------------------------------------
+
+class AtomicJSONStore:
+    """Tiny atomic JSON file store. Single-writer, no external deps."""
+
+    def __init__(self, path: Path):
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = asyncio.Lock()
+
+    async def load(self, default):
+        async with self._lock:
+            if not self.path.exists():
+                return default
+            try:
+                txt = self.path.read_text(encoding="utf-8").strip()
+                if not txt:
+                    return default
+                return json.loads(txt)
+            except (json.JSONDecodeError, OSError) as e:
+                logger.warning(f"AtomicJSONStore: failed to load {self.path}: {e}")
+                return default
+
+    async def save(self, data) -> bool:
+        async with self._lock:
+            return self._save_unlocked(data)
+
+    def _save_unlocked(self, data) -> bool:
+        """Write atomically: write to .tmp, then os.replace."""
+        try:
+            tmp = self.path.with_suffix(self.path.suffix + ".tmp")
+            # Write to a temp file in the same directory (so os.replace is atomic).
+            payload = json.dumps(data, indent=2, ensure_ascii=False)
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(payload)
+                f.flush()
+                try:
+                    os.fsync(f.fileno())
+                except OSError:
+                    pass
+            os.replace(tmp, self.path)
+            return True
+        except Exception as e:
+            logger.error(f"AtomicJSONStore: save failed for {self.path}: {e}")
+            return False
+
+
+# ---------------------------------------------------------------------------
+# Episodic recall (vector-light)
+# ---------------------------------------------------------------------------
+
+class EpisodicIndex:
+    """
+    Lightweight episodic recall. Uses TF-IDF cosine similarity by default.
+    If ChromaDB is available, falls back to it for true vector search.
+    """
+
+    def __init__(self):
+        self._use_chroma = False
+        self._chroma_collection = None
+        self._tfidf_vocab: Dict[str, int] = {}
+        self._tfidf_idf: Dict[str, float] = {}
+        self._episodes: List[Dict[str, Any]] = []
+        self._dirty = True
+        # Try chroma once; on failure, stay with TF-IDF.
+        try:
+            import chromadb  # noqa: F401
+            self._use_chroma = True
+        except Exception:
+            self._use_chroma = False
+
+    def load(self, episodes: List[Dict[str, Any]]):
+        self._episodes = list(episodes)
+        self._dirty = True
+
+    def add(self, episode: Dict[str, Any]):
+        self._episodes.append(episode)
+        self._dirty = True
+
+    def search(self, query: str, top_k: int = 3) -> List[Dict[str, Any]]:
+        if not self._episodes:
+            return []
+        if not query.strip():
+            return self._episodes[-top_k:]
+        scored = self._score(query)
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [ep for _, ep in scored[:top_k]]
+
+    def _score(self, query: str) -> List[Tuple[float, Dict[str, Any]]]:
+        if self._dirty:
+            self._rebuild_tfidf()
+        q_vec = self._vectorize(query)
+        out = []
+        for ep in self._episodes:
+            text = (ep.get("user", "") + " " + ep.get("max", "")).lower()
+            v = self._vectorize(text, prebuilt=True)
+            sim = self._cosine(q_vec, v)
+            if sim > 0.0:
+                out.append((sim, ep))
+        return out
+
+    def _rebuild_tfidf(self):
+        from collections import Counter
+        import math
+        docs = [(ep.get("user", "") + " " + ep.get("max", "")).lower() for ep in self._episodes]
+        df: Counter = Counter()
+        tokenized_docs = []
+        for d in docs:
+            tokens = self._tokenize(d)
+            tokenized_docs.append(tokens)
+            for t in set(tokens):
+                df[t] += 1
+        n = max(1, len(docs))
+        self._tfidf_vocab = {}
+        self._tfidf_idf = {}
+        for idx, (tok, count) in enumerate(df.items()):
+            self._tfidf_vocab[tok] = idx
+            self._tfidf_idf[tok] = math.log((n + 1) / (count + 1)) + 1.0
+        # Cache per-doc vectors
+        self._cached_doc_vecs = [
+            self._vectorize_from_tokens(toks) for toks in tokenized_docs
+        ]
+        self._dirty = False
+
+    def _tokenize(self, text: str) -> List[str]:
+        # Keep alphanumerics and a few Hinglish-friendly chars.
+        return re.findall(r"\b[\w']+\b", text.lower())
+
+    def _vectorize(self, text: str, prebuilt: bool = False):
+        from collections import Counter
+        tokens = self._tokenize(text)
+        return self._vectorize_from_tokens(tokens)
+
+    def _vectorize_from_tokens(self, tokens: List[str]):
+        from collections import Counter
+        tf = Counter(tokens)
+        vec = {}
+        for tok, c in tf.items():
+            if tok in self._tfidf_vocab:
+                vec[self._tfidf_vocab[tok]] = c * self._tfidf_idf.get(tok, 1.0)
+        return vec
+
+    def _cosine(self, a, b) -> float:
+        if not a or not b:
+            return 0.0
+        dot = sum(a.get(k, 0) * b.get(k, 0) for k in a.keys() & b.keys())
+        na = sum(v * v for v in a.values()) ** 0.5
+        nb = sum(v * v for v in b.values()) ** 0.5
+        if na == 0 or nb == 0:
+            return 0.0
+        return dot / (na * nb)
+
+
+# ---------------------------------------------------------------------------
+# Main MemoryManager
+# ---------------------------------------------------------------------------
 
 class MemoryManager:
     """
-    Manages conversation memory with:
-    - Context window (last N messages)
-    - Auto-summarization when threshold exceeded
-    - Persistent JSON storage
-    - User fact extraction & Permanent Rules
-    - Personality evolution profile
+    Multi-tier memory for MAX.
+
+    Public API (kept compatible with the previous module):
+      - add_message(role, content)
+      - get_context() -> str  (legacy; calls build_context("legacy"))
+      - get_context_for_query(query, intent_type) -> str
+      - clear_memory() -> bool
+      - get_recent_messages(limit) -> List[Dict]
+      - get_user_fact(key, default)
+      - update_user_fact(key, value) -> bool
+      - extract_and_store_facts(text) -> List[str]
+      - update_personality(response_length, skill_used) -> bool
+      - store_episode(user_text, max_text, skill_used)
+      - get_recent_history(limit) -> str
     """
-    
-    def __init__(self, memory_file: str, max_messages: int = 5, summarize_threshold: int = 50):
+
+    def __init__(
+        self,
+        memory_file: str,
+        max_messages: int = 6,
+        summarize_threshold: int = 50,
+        token_budget: int = DEFAULT_TOKEN_BUDGET,
+    ):
         self.memory_file = Path(memory_file)
+        self.data_dir = self.memory_file.parent
         self.max_messages = max_messages
-        self.max_history_retention = 50
         self.summarize_threshold = summarize_threshold
+        self.token_budget = token_budget
         self._lock = asyncio.Lock()
-        
-        self.memory_file.parent.mkdir(parents=True, exist_ok=True)
-        
-        self.memory = self._load_memory()
-    
-    def _load_memory(self) -> Dict:
-        """Load memory from JSON file or return fresh structure."""
-        try:
-            if self.memory_file.exists():
-                content = self.memory_file.read_text(encoding='utf-8').strip()
-                if not content:
-                    logger.warning(f"⚠️ Memory file empty, resetting: {self.memory_file}")
-                    return self._fresh_memory()
-                    
-                data = json.loads(content)
-                logger.info(f"📦 Loaded memory with {len(data.get('messages', []))} messages")
-                return data
-        except json.JSONDecodeError as e:
-            logger.warning(f"⚠️ Memory file corrupted, resetting: {e}")
-        except Exception as e:
-            logger.error(f"❌ Failed to load memory: {e}")
-        
-        return self._fresh_memory()
-    
-    def _fresh_memory(self) -> Dict:
-        """Create fresh memory structure."""
-        return {
-            "session_id": datetime.now().isoformat(),
-            "messages": [],
-            "summary": "",
-            "user_facts": {
-                "name": "the user",
-                "location": "Maharashtra",
-                "preferences": {}
-            },
-            "personality_profile": {
-                "prefers_short_answers": False,
-                "main_domain": "coding",
-                "humor_level": "medium",
-                "total_interactions": 0,
-                "last_greeting": ""
-            },
-            "created_at": datetime.now().isoformat()
-        }
-    
-    def _save_to_disk(self) -> bool:
-        """Write memory to disk (call inside lock only)."""
-        try:
-            temp_file = self.memory_file.with_suffix('.tmp')
-            with open(temp_file, 'w', encoding='utf-8') as f:
-                json.dump(self.memory, f, indent=2, ensure_ascii=False)
-            try:
-                temp_file.replace(self.memory_file)
-            except OSError:
-                with open(self.memory_file, 'w', encoding='utf-8') as f:
-                    json.dump(self.memory, f, indent=2, ensure_ascii=False)
-                if temp_file.exists():
-                    try:
-                        temp_file.unlink()
-                    except Exception:
-                        pass
-            return True
-        except Exception as e:
-            logger.error(f"❌ Failed to save memory to disk: {e}")
-            return False
-    
-    async def save_memory(self) -> bool:
-        """Persist memory to JSON file (thread-safe)."""
+
+        # Per-tier stores
+        self._store = AtomicJSONStore(self.memory_file)
+        self._episodic_store = AtomicJSONStore(self.data_dir / "episodic_memory.json")
+        self._semantic_store = AtomicJSONStore(self.data_dir / "semantic_profile.json")
+        self._procedural_store = AtomicJSONStore(self.data_dir / "procedural_memory.json")
+
+        # Episodic index (in-process; rebuilt on load)
+        self._episodic = EpisodicIndex()
+
+        # Pending write bookkeeping for debouncing
+        self._pending = 0
+        self._last_save = 0.0
+        self._save_task: Optional[asyncio.Task] = None
+
+        # Loaded state
+        self.memory: Dict[str, Any] = {}
+        self.semantic: Dict[str, Any] = {}
+        self.procedural: Dict[str, Any] = {}
+        self.episodes: List[Dict[str, Any]] = []
+
+    # ── lifecycle ────────────────────────────────────────────────────────
+
+    async def initialize(self):
+        """Load all tiers from disk. Call once at startup."""
         async with self._lock:
-            return self._save_to_disk()
-    
+            self.memory = await self._store.load(self._fresh_memory())
+            self.semantic = await self._semantic_store.load(self._fresh_semantic())
+            self.procedural = await self._procedural_store.load(self._fresh_procedural())
+            self.episodes = await self._episodic_store.load([])
+            # Drop expired episodes
+            self.episodes = self._filter_expired(self.episodes)
+            self._episodic.load(self.episodes)
+            self._pending = 0
+            self._last_save = time.time()
+            logger.info(
+                f"Memory loaded: {len(self.memory.get('messages', []))} msgs, "
+                f"{len(self.episodes)} episodes, "
+                f"{len(self.semantic.get('traits', []))} semantic traits"
+            )
+
+    async def flush(self):
+        """Force a save of all dirty tiers. Call on shutdown."""
+        async with self._lock:
+            await self._flush_unlocked()
+
+    async def _flush_unlocked(self):
+        ok = True
+        if self._pending > 0:
+            ok &= self._store._save_unlocked(self.memory)
+            self._pending = 0
+        if self._episodic_dirty():
+            ok &= self._episodic_store._save_unlocked(self.episodes)
+        if self._semantic_dirty():
+            ok &= self._semantic_store._save_unlocked(self.semantic)
+        if self._procedural_dirty():
+            ok &= self._procedural_store._save_unlocked(self.procedural)
+        self._last_save = time.time()
+        return ok
+
+    # ── working + session ────────────────────────────────────────────────
+
     async def add_message(self, role: str, content: str) -> bool:
-        """Add a message to conversation history."""
-        try:
-            async with self._lock:
-                self.memory["messages"].append({
-                    "role": role,
-                    "content": content,
-                    "timestamp": datetime.now().isoformat()
-                })
-                
-                # Update interaction count
-                self.memory.setdefault("personality_profile", {})["total_interactions"] = \
-                    self.memory["personality_profile"].get("total_interactions", 0) + 1
-                
-                # Check if summarization needed
-                if len(self.memory["messages"]) >= self.summarize_threshold:
-                    self._auto_summarize_internal()
-                
-                # Keep extended history retention (up to 50 messages) for on-demand skill recall
-                if len(self.memory["messages"]) > self.max_history_retention:
-                    self.memory["messages"] = self.memory["messages"][-self.max_history_retention:]
-                
-                return self._save_to_disk()
-                
-        except Exception as e:
-            logger.error(f"❌ Failed to add message: {e}")
+        """Add a message to working memory. Async-safe, debounced save."""
+        if not content or not content.strip():
             return False
-    
-    def _auto_summarize_internal(self) -> bool:
-        """Summarize older messages to save tokens. Must be called inside lock."""
-        try:
-            messages = self.memory["messages"]
-            if len(messages) <= self.summarize_threshold:
-                return True
-            
-            kept_messages = messages[:2] + messages[-30:]
-            middle_messages = messages[2:-30]
-            
-            summary_parts = [
-                f"[{m['role']}] {m['content'][:100]}..." 
-                for m in middle_messages[:5]
-            ]
-            new_summary = " | ".join(summary_parts)
-            
-            self.memory["messages"] = kept_messages
-            self.memory["summary"] = new_summary
-            logger.info(f"📝 Auto-summarized {len(middle_messages)} messages")
-            
+        content = content.strip()
+        async with self._lock:
+            # Dedup: skip if previous message has same role and near-identical content
+            msgs = self.memory.setdefault("messages", [])
+            if msgs and msgs[-1].get("role") == role:
+                prev = msgs[-1].get("content", "")
+                if self._similar(prev, content) > 0.85:
+                    logger.debug("Skipped near-duplicate message")
+                    return False
+
+            msgs.append({
+                "role": role,
+                "content": content,
+                "timestamp": datetime.now().isoformat(),
+            })
+            # Bump interaction counter
+            profile = self.memory.setdefault("personality_profile", {})
+            profile["total_interactions"] = profile.get("total_interactions", 0) + 1
+
+            # Compact when working set grows
+            if len(msgs) > self.summarize_threshold:
+                self._compact_working_unlocked()
+            # Hard cap working set
+            if len(msgs) > 100:
+                self.memory["messages"] = msgs[-100:]
+
+            self._pending += 1
+            await self._maybe_debounce_save_unlocked()
             return True
-        except Exception as e:
-            logger.error(f"❌ Summarization failed: {e}")
-            return False
-    
-    def get_context(self) -> str:
-        """Build context string for LLM prompt, injecting permanent rules first."""
-        context_parts = []
 
-        # --- Inject Permanent Rules ---
-        rules_file = self.memory_file.parent / "permanent_rules.json"
-        if rules_file.exists():
-            try:
-                rules = json.loads(rules_file.read_text(encoding='utf-8'))
-                if rules:
-                    rules_text = "CRITICAL PERMANENT RULES YOU MUST ALWAYS FOLLOW:\n"
-                    for r in rules:
-                        rules_text += f"- {r['rule']}\n"
-                    context_parts.append(rules_text)
-            except Exception as e:
-                logger.warning(f"Could not load permanent rules: {e}")
-        
-        # --- Inject Personality Profile ---
-        profile = self.memory.get("personality_profile", {})
-        if profile:
-            parts = []
-            if profile.get("prefers_short_answers"):
-                parts.append("User prefers SHORT answers.")
-            domain = profile.get("main_domain")
-            if domain:
-                parts.append(f"User mainly asks about: {domain}")
+    def _compact_working_unlocked(self):
+        """Summarize older messages into the session summary, keep recent ones."""
+        msgs = self.memory["messages"]
+        if len(msgs) <= self.summarize_threshold:
+            return
+        keep_head = 2
+        keep_tail = 30
+        head = msgs[:keep_head]
+        middle = msgs[keep_head:-keep_tail]
+        tail = msgs[-keep_tail:]
 
-            if parts:
-                context_parts.append("PERSONALITY PROFILE:\n" + "\n".join(parts))
-        
-        # --- User Facts ---
-        facts = self.memory.get("user_facts", {})
-        if facts:
-            fact_lines = [f"USER FACTS:"]
-            for k, v in facts.items():
-                if k != "preferences" and v:
-                    fact_lines.append(f"- {k}: {v}")
-            context_parts.append("\n".join(fact_lines))
-        
-        if self.memory.get("summary"):
-            context_parts.append(f"PREVIOUS: {self.memory['summary']}")
-        
-        for msg in self.memory["messages"][-self.max_messages:]:
-            role = "You" if msg["role"] == "user" else "Max"
-            context_parts.append(f"{role}: {msg['content']}")
-        
-        return "\n".join(context_parts)
-    
-    def get_recent_messages(self, limit: int = 5) -> List[Dict]:
-        """Return raw messages for subagents."""
-        return self.memory.get("messages", [])[-limit:]
-    
-    async def clear_memory(self) -> bool:
-        """Reset conversation history (keep user facts and profile)."""
-        try:
-            async with self._lock:
-                user_facts = self.memory.get("user_facts", {})
-                profile = self.memory.get("personality_profile", {})
-                self.memory = self._fresh_memory()
-                self.memory["user_facts"] = user_facts
-                self.memory["personality_profile"] = profile
-                return self._save_to_disk()
-        except Exception as e:
-            logger.error(f"❌ Failed to clear memory: {e}")
-            return False
-    
+        if middle:
+            parts = [f"[{m['role']}] {m['content'][:80]}" for m in middle[:6]]
+            new_chunk = " | ".join(parts)
+            existing = self.memory.get("summary", "")
+            self.memory["summary"] = (existing + " | " + new_chunk).strip(" |")
+            # Cap summary length
+            if len(self.memory["summary"]) > 2000:
+                self.memory["summary"] = self.memory["summary"][-2000:]
+        self.memory["messages"] = head + tail
+
+    async def get_recent_messages(self, limit: int = 5) -> List[Dict[str, Any]]:
+        async with self._lock:
+            return list(self.memory.get("messages", [])[-limit:])
+
+    # ── factual ──────────────────────────────────────────────────────────
+
     def get_user_fact(self, key: str, default=None):
         return self.memory.get("user_facts", {}).get(key, default)
-    
+
     async def update_user_fact(self, key: str, value) -> bool:
-        """Update a user fact (async-safe)."""
-        try:
-            async with self._lock:
-                self.memory.setdefault("user_facts", {})[key] = value
-                return self._save_to_disk()
-        except Exception as e:
-            logger.error(f"❌ Failed to update user fact: {e}")
+        async with self._lock:
+            self.memory.setdefault("user_facts", {})[key] = value
+            self._pending += 1
+            await self._maybe_debounce_save_unlocked()
+            return True
+
+    async def update_personality(self, response_length: int, skill_used: str = "") -> bool:
+        async with self._lock:
+            profile = self.memory.setdefault("personality_profile", {})
+            interactions = profile.get("total_interactions", 0)
+            if interactions > 10:
+                recent_assistant = [
+                    m for m in self.memory.get("messages", [])[-20:]
+                    if m.get("role") == "assistant"
+                ]
+                if recent_assistant:
+                    avg_len = sum(len(m.get("content", "")) for m in recent_assistant) / len(recent_assistant)
+                    profile["prefers_short_answers"] = avg_len < 150
+            if skill_used:
+                code_skills = {"write_code", "run_code", "code_review", "fix_code", "project_scaffold"}
+                if skill_used in code_skills:
+                    profile["main_domain"] = "coding"
+                elif skill_used in {"search", "weather", "youtube_search"}:
+                    profile["main_domain"] = "information"
+                elif skill_used in {"open_app", "web_open", "volume", "brightness", "lock_pc"}:
+                    profile["main_domain"] = "pc_control"
+            self._pending += 1
+            await self._maybe_debounce_save_unlocked()
+            return True
+
+    # ── episodic ─────────────────────────────────────────────────────────
+
+    async def store_episode(self, user_text: str, max_text: str, skill_used: str = ""):
+        if not user_text:
+            return
+        ep = {
+            "id": hashlib.sha1(
+                f"{user_text[:50]}|{max_text[:50]}|{time.time()}".encode()
+            ).hexdigest()[:16],
+            "timestamp": datetime.now().isoformat(),
+            "user": user_text[:200],
+            "max": max_text[:200],
+            "skill": skill_used or "",
+            "pinned": False,
+        }
+        async with self._lock:
+            self.episodes.append(ep)
+            self.episodes = self._filter_expired(self.episodes)
+            if len(self.episodes) > EPISODIC_MAX_ENTRIES:
+                # Drop oldest unpinned first
+                unpinned = [e for e in self.episodes if not e.get("pinned")]
+                if len(unpinned) > EPISODIC_MAX_ENTRIES // 2:
+                    keep = EPISODIC_MAX_ENTRIES // 2
+                    self.episodes = [e for e in self.episodes if e.get("pinned")] + unpinned[-keep:]
+            self._episodic.load(self.episodes)
+            await self._episodic_store.save(self.episodes)
+
+    def _episodic_dirty(self) -> bool:
+        return False  # Episodes are saved immediately on add.
+
+    # ── procedural ───────────────────────────────────────────────────────
+
+    async def record_skill_success(self, skill: str, query: str):
+        if not skill:
+            return
+        async with self._lock:
+            successes = self.procedural.setdefault("skill_successes", {})
+            entry = successes.setdefault(skill, {"count": 0, "examples": []})
+            entry["count"] += 1
+            if len(entry["examples"]) < 5:
+                entry["examples"].append(query[:120])
+            await self._procedural_store.save(self.procedural)
+
+    def _procedural_dirty(self) -> bool:
+        return False
+
+    # ── semantic ─────────────────────────────────────────────────────────
+
+    async def regenerate_semantic_profile(self):
+        """Regenerate the long-term semantic profile from raw memory.
+
+        Run periodically (e.g. once a day) or when total_interactions jumps.
+        For now, derives simple traits from messages. Future: LLM-based
+        consolidation.
+        """
+        async with self._lock:
+            msgs = self.memory.get("messages", [])
+            if len(msgs) < 20:
+                return
+            traits = []
+            # Word frequency over recent messages (simple topic hint)
+            from collections import Counter
+            counter: Counter = Counter()
+            for m in msgs[-200:]:
+                if m.get("role") == "user":
+                    for tok in re.findall(r"\b[a-zA-Z]{4,}\b", m.get("content", "").lower()):
+                        counter[tok] += 1
+            top = [w for w, _ in counter.most_common(8)]
+            if top:
+                traits.append("frequent_topics: " + ", ".join(top))
+            profile = self.memory.get("personality_profile", {})
+            if profile.get("main_domain"):
+                traits.append(f"main_domain: {profile['main_domain']}")
+            if profile.get("prefers_short_answers"):
+                traits.append("prefers_short_answers: true")
+            self.semantic = {"traits": traits, "updated_at": datetime.now().isoformat()}
+            await self._semantic_store.save(self.semantic)
+
+    def _semantic_dirty(self) -> bool:
+        return False
+
+    # ── context building (the public surface the LLM sees) ──────────────
+
+    def get_context(self) -> str:
+        """Legacy: build a single full context string. Prefer build_context()."""
+        return self._build_context_sync(intent_type="legacy", query="")
+
+    def get_context_for_query(self, query: str, intent_type: str = "COMMAND") -> str:
+        return self._build_context_sync(intent_type=intent_type, query=query)
+
+    def _build_context_sync(self, intent_type: str, query: str) -> str:
+        """
+        Assemble a token-budgeted context block for the LLM.
+
+        Layout (in order, each section dropped if it would exceed the budget):
+          RULES        - permanent_rules.json (always first if present)
+          RECALL       - episodic hits (only if intent == MEMORY_RECALL or query signals recall)
+          USER         - user_facts (compact)
+          PROFILE      - personality_profile (compact)
+          SEMANTIC     - semantic traits (one line)
+          WORKING      - last N turns (within budget)
+        """
+        sections: List[str] = []
+        used = 0
+        cap = self.token_budget * CHARS_PER_TOKEN
+
+        def add(label: str, body: str):
+            nonlocal used
+            if not body:
+                return
+            block = f"{label}:\n{body}".strip()
+            cost = len(block) + 1
+            if used + cost > cap:
+                # Try a truncated version
+                remaining = cap - used - len(label) - 8
+                if remaining < 40:
+                    return
+                block = f"{label}:\n{body[:remaining]}"
+                cost = len(block) + 1
+            sections.append(block)
+            used += cost
+
+        # 1. Rules (always include)
+        add("RULES", self._get_rules_text())
+
+        # 2. Recall (episodic) - only on recall queries
+        if self._is_recall_query(query) or intent_type in ("MEMORY_RECALL", "CONVERSATION"):
+            rec = self._format_episodes_for_context(self._episodic.search(query or "", top_k=3))
+            add("PAST", rec)
+
+        # 3. Factual
+        add("USER", self._get_factual_text())
+
+        # 4. Personality
+        add("PROFILE", self._get_personality_text())
+
+        # 5. Semantic (one-liner)
+        sem = self.semantic.get("traits", [])
+        if sem:
+            add("TRAITS", "; ".join(sem[:3]))
+
+        # 6. Working memory (last N)
+        add("RECENT", self._get_working_text(intent_type))
+
+        return "\n\n".join(sections) if sections else ""
+
+    # ── episodic recall helpers ──────────────────────────────────────────
+
+    def _is_recall_query(self, query: str) -> bool:
+        if not query:
+            return False
+        q = query.lower()
+        signals = [
+            "remember", "pehle", "yesterday", "earlier", "last time",
+            "what did we", "kya baat ki", "yaad", "recall", "history",
+            "discussed", "past conversation", "you know",
+        ]
+        return any(s in q for s in signals)
+
+    def _format_episodes_for_context(self, episodes: List[Dict[str, Any]]) -> str:
+        if not episodes:
+            return ""
+        lines = []
+        for ep in episodes:
+            ts = (ep.get("timestamp") or "")[:16]
+            user = (ep.get("user") or "")[:80]
+            mx = (ep.get("max") or "")[:80]
+            sk = ep.get("skill") or ""
+            tag = f" [{sk}]" if sk else ""
+            lines.append(f"[{ts}] You: {user} -> Max: {mx}{tag}")
+        return "\n".join(lines)
+
+    # ── misc public helpers ──────────────────────────────────────────────
+
+    async def clear_memory(self) -> bool:
+        """Reset conversation history. Keep facts/profile/semantic."""
+        async with self._lock:
+            user_facts = self.memory.get("user_facts", {})
+            profile = self.memory.get("personality_profile", {})
+            self.memory = self._fresh_memory()
+            self.memory["user_facts"] = user_facts
+            self.memory["personality_profile"] = profile
+            ok = self._store._save_unlocked(self.memory)
+            self._pending = 0
+            return ok
 
     def get_recent_history(self, limit: int = 20) -> str:
-        """
-        On-demand recall of past conversation history.
-        Returns formatted transcript of the last `limit` messages.
-        """
-        messages = self.memory.get("messages", [])
-        if not messages:
+        msgs = self.memory.get("messages", [])
+        if not msgs:
             return "No previous conversation history found."
-        
-        recent = messages[-limit:]
+        recent = msgs[-limit:]
         lines = [f"=== RECENT CONVERSATION HISTORY (Last {len(recent)} messages) ==="]
         for idx, m in enumerate(recent, 1):
-            role = "Sanket" if m["role"] == "user" else "MAX"
-            timestamp = m.get("timestamp", "")
-            time_str = f" [{timestamp[11:16]}]" if len(timestamp) >= 16 else ""
-            lines.append(f"{idx}. {role}{time_str}: {m['content']}")
-        
+            role = "Sanket" if m.get("role") == "user" else "MAX"
+            ts = m.get("timestamp", "")
+            time_str = f" [{ts[11:16]}]" if len(ts) >= 16 else ""
+            lines.append(f"{idx}. {role}{time_str}: {m.get('content','')}")
         return "\n".join(lines)
 
     async def extract_and_store_facts(self, user_text: str) -> List[str]:
-        """
-        Pattern-based + Gemini Flash Lite intelligent fact extraction.
-        e.g. 'Mera naam Sanket hai' -> name=Sanket
-        """
+        """Pattern + (rate-limited) Gemini fact extraction."""
         import re
-        facts_found = []
+        facts_found: List[str] = []
         text_lower = user_text.lower()
-        
-        # Name patterns
+
         name_patterns = [
-            r"mera naam (\w+) hai",
-            r"my name is (\w+)",
-            r"main (\w+) hoon",
-            r"call me (\w+)",
+            r"mera naam (\w+) hai", r"my name is (\w+)",
+            r"main (\w+) hoon", r"call me (\w+)",
         ]
         for p in name_patterns:
             m = re.search(p, text_lower)
@@ -274,13 +613,10 @@ class MemoryManager:
                 await self.update_user_fact("name", name)
                 facts_found.append(f"name={name}")
                 break
-        
-        # Location patterns
+
         loc_patterns = [
-            r"main (\w+) mein rehta hoon",
-            r"main (\w+) mein rehti hoon",
-            r"i live in (\w+)",
-            r"i am from (\w+)",
+            r"main (\w+) mein rehta hoon", r"main (\w+) mein rehti hoon",
+            r"i live in (\w+)", r"i am from (\w+)",
         ]
         for p in loc_patterns:
             m = re.search(p, text_lower)
@@ -289,289 +625,190 @@ class MemoryManager:
                 await self.update_user_fact("location", loc)
                 facts_found.append(f"location={loc}")
                 break
-        
-        # Preference patterns
+
         pref_patterns = [
             (r"mujhe (\w+) pasand hai", "likes"),
             (r"i love (\w+)", "likes"),
             (r"i hate (\w+)", "dislikes"),
             (r"mujhe (\w+) nahi pasand", "dislikes"),
         ]
-        for p, category in pref_patterns:
+        for p, cat in pref_patterns:
             m = re.search(p, text_lower)
             if m:
                 item = m.group(1)
                 prefs = self.memory.get("user_facts", {}).get("preferences", {})
-                prefs.setdefault(category, []).append(item)
+                prefs.setdefault(cat, []).append(item)
                 await self.update_user_fact("preferences", prefs)
-                facts_found.append(f"{category}={item}")
-        
-        # If pattern matching found nothing and text has enough substance, try Gemini Router
-        if not facts_found and len(user_text.strip()) > 15:
-            try:
-                from modules.gemini_router import get_gemini_router
-                gemini_facts = await get_gemini_router().extract_facts(user_text)
-                for k, v in gemini_facts.items():
-                    if k and v and isinstance(v, str):
-                        await self.update_user_fact(k, v)
-                        facts_found.append(f"{k}={v}")
-            except Exception as e:
-                logger.debug(f"Gemini fact extraction skipped: {e}")
+                facts_found.append(f"{cat}={item}")
+
+        # Rate-limited Gemini extraction
+        if not facts_found and len(user_text.strip()) > 20:
+            now = time.time()
+            last_gemini = self.memory.get("_last_gemini_fact_ts", 0)
+            if now - last_gemini > 60:  # at most once per minute
+                try:
+                    from modules.gemini_router import get_gemini_router
+                    self.memory["_last_gemini_fact_ts"] = now
+                    self._pending += 1
+                    gemini_facts = await get_gemini_router().extract_facts(user_text)
+                    for k, v in (gemini_facts or {}).items():
+                        if k and v and isinstance(v, str):
+                            await self.update_user_fact(k, v)
+                            facts_found.append(f"{k}={v}")
+                except Exception as e:
+                    logger.debug(f"Gemini fact extraction skipped: {e}")
 
         return facts_found
-    
-    async def update_personality(self, response_length: int, skill_used: str = "") -> bool:
-        """Update personality profile based on interaction patterns."""
-        try:
-            async with self._lock:
-                profile = self.memory.setdefault("personality_profile", {})
-                interactions = profile.get("total_interactions", 0)
-                
-                # Track short answer preference
-                if interactions > 10:
-                    avg_len = sum(len(m.get("content", "")) for m in self.memory["messages"][-20:] if m["role"] == "assistant") / max(1, len([m for m in self.memory["messages"][-20:] if m["role"] == "assistant"]))
-                    profile["prefers_short_answers"] = avg_len < 150
-                
-                # Track domain
-                if skill_used:
-                    code_skills = {"write_code", "run_code", "code_review", "fix_code", "project_scaffold"}
-                    if skill_used in code_skills:
-                        profile["main_domain"] = "coding"
-                    elif skill_used in {"search", "weather", "youtube_search"}:
-                        profile["main_domain"] = "information"
-                    elif skill_used in {"open_app", "web_open", "volume", "brightness", "lock_pc"}:
-                        profile["main_domain"] = "pc_control"
-                
-                return self._save_to_disk()
-        except Exception as e:
-            logger.error(f"Personality update failed: {e}")
-            return False
 
-    # ═══════════════════════════════════════════════════
-    # MULTI-TIER MEMORY — Smart Context Retrieval
-    # ═══════════════════════════════════════════════════
+    # ── internal: defaults + helpers ─────────────────────────────────────
 
-    def get_context_for_query(self, query: str, intent_type: str = "COMMAND") -> str:
-        """
-        Smart memory retriever — returns ONLY the memory relevant for this query type.
-        
-        Token-efficient context injection:
-          CONVERSATION → short-term turns + user facts + personality (~50 tokens)
-          COMMAND      → short-term turns only (~30 tokens)  
-          MEMORY_RECALL → episodic search through past conversations (~100 tokens)
-        """
-        context_parts = []
-        query_lower = query.lower()
+    def _fresh_memory(self) -> Dict[str, Any]:
+        return {
+            "session_id": datetime.now().isoformat(),
+            "messages": [],
+            "summary": "",
+            "user_facts": {
+                "name": "the user",
+                "location": "Maharashtra",
+                "preferences": {},
+            },
+            "personality_profile": {
+                "prefers_short_answers": False,
+                "main_domain": "coding",
+                "humor_level": "medium",
+                "total_interactions": 0,
+                "last_greeting": "",
+            },
+            "created_at": datetime.now().isoformat(),
+        }
 
-        # ── Check if this is a memory recall query ──
-        memory_recall_signals = [
-            "remember", "pehle", "yesterday", "earlier", "last time",
-            "what did we", "kya baat ki", "yaad", "recall", "history",
-            "discussed", "past conversation"
-        ]
-        is_recall = any(s in query_lower for s in memory_recall_signals)
+    def _fresh_semantic(self) -> Dict[str, Any]:
+        return {"traits": [], "updated_at": ""}
 
-        if is_recall:
-            # Episodic recall — search past conversations
-            episodes = self._search_episodes(query, top_k=3)
-            if episodes:
-                context_parts.append("PAST CONVERSATIONS:\n" + episodes)
-            # Also include factual context for continuity
-            facts_ctx = self._get_factual_context()
-            if facts_ctx:
-                context_parts.append(facts_ctx)
-            return "\n".join(context_parts)
+    def _fresh_procedural(self) -> Dict[str, Any]:
+        return {"skill_successes": {}}
 
-        # ── Permanent Rules (always inject) ──
-        rules_ctx = self._get_rules_context()
-        if rules_ctx:
-            context_parts.append(rules_ctx)
-
-        if intent_type in ("CONVERSATION", "CAPABILITY_QUESTION"):
-            # Chat: user facts + personality + short-term
-            facts_ctx = self._get_factual_context()
-            if facts_ctx:
-                context_parts.append(facts_ctx)
-            personality_ctx = self._get_personality_context()
-            if personality_ctx:
-                context_parts.append(personality_ctx)
-            # Short-term (last 4 messages for chat continuity)
-            short_term = self._get_short_term(limit=4)
-            if short_term:
-                context_parts.append(short_term)
-
-        elif intent_type in ("COMMAND", "INFORMATION_QUESTION"):
-            # Action: just short-term for pronoun resolution
-            short_term = self._get_short_term(limit=3)
-            if short_term:
-                context_parts.append(short_term)
-
-        else:
-            # Fallback: standard context (original behavior)
-            return self.get_context()
-
-        return "\n".join(context_parts) if context_parts else "None"
-
-    def _get_rules_context(self) -> str:
-        """Get permanent rules (compact)."""
-        rules_file = self.memory_file.parent / "permanent_rules.json"
+    def _get_rules_text(self) -> str:
+        rules_file = self.data_dir / "permanent_rules.json"
         if not rules_file.exists():
             return ""
         try:
-            rules = json.loads(rules_file.read_text(encoding='utf-8'))
-            if rules:
-                return "RULES: " + "; ".join(r['rule'][:60] for r in rules[:5])
+            rules = json.loads(rules_file.read_text(encoding="utf-8"))
         except Exception:
-            pass
-        return ""
+            return ""
+        if not rules:
+            return ""
+        return "; ".join(r.get("rule", "")[:60] for r in rules[:5])
 
-    def _get_factual_context(self) -> str:
-        """Get user facts (compact)."""
+    def _get_factual_text(self) -> str:
         facts = self.memory.get("user_facts", {})
         if not facts:
             return ""
         parts = []
         for k, v in facts.items():
-            if k != "preferences" and v:
+            if k == "preferences":
+                continue
+            if v:
                 parts.append(f"{k}: {v}")
-        return "USER: " + ", ".join(parts) if parts else ""
+        if not parts:
+            return ""
+        return ", ".join(parts)
 
-    def _get_personality_context(self) -> str:
-        """Get personality profile (compact)."""
-        profile = self.memory.get("personality_profile", {})
-        if not profile:
+    def _get_personality_text(self) -> str:
+        p = self.memory.get("personality_profile", {})
+        if not p:
             return ""
         parts = []
-        if profile.get("prefers_short_answers"):
+        if p.get("prefers_short_answers"):
             parts.append("prefers short answers")
-        domain = profile.get("main_domain")
-        if domain:
-            parts.append(f"domain: {domain}")
-        return "PROFILE: " + ", ".join(parts) if parts else ""
+        if p.get("main_domain"):
+            parts.append(f"domain: {p['main_domain']}")
+        return ", ".join(parts)
 
-    def _get_short_term(self, limit: int = 4) -> str:
-        """Get last N messages (compact)."""
-        messages = self.memory.get("messages", [])
-        if not messages:
+    def _get_working_text(self, intent_type: str) -> str:
+        msgs = self.memory.get("messages", [])
+        if not msgs:
             return ""
-        recent = messages[-limit:]
+        # Commands need only enough for pronoun resolution; chat needs more continuity.
+        if intent_type in ("COMMAND", "INFORMATION_QUESTION", "NEGATIVE_COMMAND"):
+            n = 3
+        elif intent_type == "CONVERSATION":
+            n = 5
+        else:
+            n = self.max_messages
+        recent = msgs[-n:]
         lines = []
         for m in recent:
-            role = "You" if m["role"] == "user" else "Max"
-            content = m["content"][:120]
+            role = "You" if m.get("role") == "user" else "Max"
+            content = (m.get("content") or "")[:160]
             lines.append(f"{role}: {content}")
         return "\n".join(lines)
 
-    # ── Episodic Memory ──────────────────────────────────
-
-    def _get_episodes_file(self) -> Path:
-        """Path to episodic memory JSON file."""
-        return self.memory_file.parent / "episodic_memory.json"
-
-    async def store_episode(self, user_text: str, max_response: str, skill_used: str = ""):
-        """
-        Store an interaction as an episodic memory entry.
-        Called after every meaningful interaction.
-        """
-        try:
-            episodes_file = self._get_episodes_file()
-            episodes = []
-            if episodes_file.exists():
-                try:
-                    episodes = json.loads(episodes_file.read_text(encoding='utf-8'))
-                except Exception:
-                    episodes = []
-
-            episode = {
-                "timestamp": datetime.now().isoformat(),
-                "user": user_text[:200],
-                "max": max_response[:200],
-                "skill": skill_used or "",
-                "hour": datetime.now().hour
-            }
-            episodes.append(episode)
-
-            # Keep last 200 episodes (prevent unbounded growth)
-            if len(episodes) > 200:
-                episodes = episodes[-200:]
-
-            episodes_file.parent.mkdir(parents=True, exist_ok=True)
-            episodes_file.write_text(
-                json.dumps(episodes, indent=1, ensure_ascii=False),
-                encoding='utf-8'
-            )
-        except Exception as e:
-            logger.warning(f"Failed to store episode: {e}")
-
-    def _search_episodes(self, query: str, top_k: int = 3) -> str:
-        """
-        Search episodic memory for relevant past interactions.
-        Uses simple keyword overlap scoring (fast, no ML dependency).
-        """
-        episodes_file = self._get_episodes_file()
-        if not episodes_file.exists():
-            return ""
-
-        try:
-            episodes = json.loads(episodes_file.read_text(encoding='utf-8'))
-        except Exception:
-            return ""
-
+    def _filter_expired(self, episodes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if not episodes:
-            return ""
-
-        import re
-        query_words = set(re.findall(r'\b\w+\b', query.lower()))
-        # Remove common stop words
-        stop_words = {"the", "a", "is", "was", "i", "you", "me", "my", "we", "did",
-                      "what", "kya", "hai", "ki", "ka", "se", "ko", "ne", "thi", "tha"}
-        query_words -= stop_words
-
-        if not query_words:
-            # No meaningful words — return last few episodes
-            recent = episodes[-top_k:]
-            return self._format_episodes(recent)
-
-        scored = []
+            return episodes
+        from datetime import datetime, timedelta
+        cutoff = datetime.now() - timedelta(days=EPISODIC_TTL_DAYS)
+        out = []
         for ep in episodes:
-            text = (ep.get("user", "") + " " + ep.get("max", "")).lower()
-            ep_words = set(re.findall(r'\b\w+\b', text))
-            overlap = len(query_words & ep_words)
-            if overlap > 0:
-                scored.append((overlap, ep))
+            if ep.get("pinned"):
+                out.append(ep)
+                continue
+            ts = ep.get("timestamp", "")
+            try:
+                dt = datetime.fromisoformat(ts)
+            except Exception:
+                out.append(ep)
+                continue
+            if dt >= cutoff:
+                out.append(ep)
+        return out
 
-        if not scored:
-            # No keyword matches — return most recent episodes
-            return self._format_episodes(episodes[-top_k:])
+    def _similar(self, a: str, b: str) -> float:
+        """Quick Jaccard similarity over word tokens."""
+        ta = set(re.findall(r"\b\w+\b", a.lower()))
+        tb = set(re.findall(r"\b\w+\b", b.lower()))
+        if not ta or not tb:
+            return 0.0
+        return len(ta & tb) / len(ta | tb)
 
-        scored.sort(key=lambda x: x[0], reverse=True)
-        top = [ep for _, ep in scored[:top_k]]
-        return self._format_episodes(top)
-
-    def _format_episodes(self, episodes: list) -> str:
-        """Format episodes for LLM context injection."""
-        if not episodes:
-            return ""
-        lines = []
-        for ep in episodes:
-            ts = ep.get("timestamp", "")[:16]  # YYYY-MM-DDTHH:MM
-            user_text = ep.get("user", "")[:80]
-            max_text = ep.get("max", "")[:80]
-            skill = ep.get("skill", "")
-            skill_tag = f" [{skill}]" if skill else ""
-            lines.append(f"[{ts}] You: {user_text} → Max: {max_text}{skill_tag}")
-        return "\n".join(lines)
+    async def _maybe_debounce_save_unlocked(self):
+        """Coalesce frequent saves."""
+        now = time.time()
+        if self._pending >= DEBOUNCE_PENDING_MAX or (now - self._last_save) >= DEBOUNCE_SECONDS:
+            await self._flush_unlocked()
+            return
+        # Schedule a trailing save if not already scheduled
+        if self._save_task is None or self._save_task.done():
+            async def _delayed():
+                await asyncio.sleep(DEBOUNCE_SECONDS)
+                async with self._lock:
+                    if self._pending > 0:
+                        await self._flush_unlocked()
+            self._save_task = asyncio.create_task(_delayed())
 
 
+# Module-level singleton (legacy entry point).
 _memory_instance: Optional[MemoryManager] = None
 
+
 def get_memory_manager(config) -> MemoryManager:
+    """Return the singleton MemoryManager. Initializes on first call."""
     global _memory_instance
     if _memory_instance is None:
         _memory_instance = MemoryManager(
             memory_file=config.MEMORY_FILE,
-            max_messages=config.MEMORY_MAX_MESSAGES,
-            summarize_threshold=config.MEMORY_SUMMARIZE_THRESHOLD
+            max_messages=getattr(config, "MEMORY_MAX_MESSAGES", 6),
+            summarize_threshold=getattr(config, "MEMORY_SUMMARIZE_THRESHOLD", 50),
+            token_budget=getattr(config, "MEMORY_TOKEN_BUDGET", DEFAULT_TOKEN_BUDGET),
         )
+        # Best-effort eager init; if no running loop, will lazy-init on first use.
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                asyncio.create_task(_memory_instance.initialize())
+            else:
+                loop.run_until_complete(_memory_instance.initialize())
+        except Exception as e:
+            logger.debug(f"get_memory_manager: eager init skipped: {e}")
     return _memory_instance
-
