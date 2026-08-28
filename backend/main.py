@@ -264,6 +264,13 @@ async def _on_startup():
     # except Exception as e:
     #     logger.warning(f"Health Buddy start failed: {e}")
 
+    # 4. Module self-test - logs which critical modules loaded vs fell back
+    try:
+        from modules.module_selftest import run_module_selftest
+        asyncio.create_task(run_module_selftest(force=True))
+    except Exception as e:
+        logger.debug(f"Module self-test schedule failed: {e}")
+
 
 zeroconf_instance = None
 
@@ -279,6 +286,16 @@ async def _on_shutdown():
             logger.info("mDNS zeroconf stopped")
         except Exception:
             pass
+
+    # Flush memory so no buffered messages are lost on exit.
+    try:
+        from agent_core import get_agent
+        agent = get_agent()
+        if agent and getattr(agent, "memory", None):
+            await agent.memory.flush()
+            logger.info("Memory flushed on shutdown")
+    except Exception as e:
+        logger.debug(f"Memory flush on shutdown skipped: {e}")
 
 
 @app.on_event("startup")
@@ -1029,6 +1046,22 @@ async def health_check():
         "llm_model": config.LLM_MODEL,
         "tts_voice": config.TTS_VOICE,
     }
+
+
+@app.get("/health/modules")
+async def health_modules():
+    """
+    Returns the result of the startup module self-test. Shows which
+    critical modules loaded real implementations vs fell back to stubs,
+    so you can quickly see what's broken.
+    """
+    from modules.module_selftest import get_module_status, run_module_selftest
+    # Refresh on demand if the cached result is older than 60s
+    status = get_module_status()
+    if not status.get("ran_at") or (time.time() - status["ran_at"]) > 60:
+        await run_module_selftest(force=True)
+        status = get_module_status()
+    return status
 
 
 # ═══════════════════════════════════════════════════
