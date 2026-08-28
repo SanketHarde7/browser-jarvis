@@ -104,7 +104,7 @@ health_buddy_instance: Optional[Any] = None
 # ═══════════════════════════════════════════════════
 # LOGGING
 # ═══════════════════════════════════════════════════
-
+    
 logging.basicConfig(
     level=logging.INFO if not config.DEBUG else logging.DEBUG,
     format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
@@ -328,9 +328,11 @@ async def startup_event():
 class TextInput(BaseModel):
     text: str
     tts: bool = True
+    device_id: str = ""
 
 class VoiceRequest(BaseModel):
     audio: str
+    device_id: str = ""
 
 class WakeCheckRequest(BaseModel):
     audio: str
@@ -585,7 +587,8 @@ async def process_voice_request(
             # Halt downstream LLM execution to stop continuous voice listening bleeding
             return
 
-        result = await agent.process_text_input(transcript, use_tts=True, input_source="voice")
+        sender_dev = getattr(websocket, "device_name", "")
+        result = await agent.process_text_input(transcript, use_tts=True, input_source="voice", sender_device=sender_dev)
         
         # ── Check for device switch intent ──
         if result.get("intent") == "device_switch":
@@ -809,7 +812,8 @@ async def websocket_endpoint(websocket: WebSocket, token: str = None, device: st
                     if text_intercepted:
                         continue
 
-                    result = await agent.process_text_input(user_text, use_tts=True, input_source="text")
+                    sender_dev = getattr(websocket, "device_name", "")
+                    result = await agent.process_text_input(user_text, use_tts=True, input_source="text", sender_device=sender_dev)
                     
                     if result.get("intent") == "device_switch":
                         logger.info("Device switch executed via text. Target device notified directly.")
@@ -1059,7 +1063,7 @@ async def voice(request: VoiceRequest, _auth=Depends(verify_token)):
             "skill_used": None,
         }
 
-    result = await agent.process_text_input(transcript, use_tts=True, input_source="voice")
+    result = await agent.process_text_input(transcript, use_tts=True, input_source="voice", sender_device=request.device_id)
 
     response_data = {
         "transcript": transcript,
@@ -1359,7 +1363,7 @@ async def plugins_reload(_auth=Depends(verify_token)):
 @app.post("/api/chat")
 async def chat(request: TextInput, _auth=Depends(verify_token)):
     agent = get_agent()
-    result = await agent.process_text_input(request.text, use_tts=request.tts, input_source="text")
+    result = await agent.process_text_input(request.text, use_tts=request.tts, input_source="text", sender_device=request.device_id)
     response_data = {
         "response": result.get("response", ""),
         "skill_used": result.get("skill_used"),

@@ -4,7 +4,7 @@
 import os
 import sys
 import json
-import random
+import secrets
 import logging
 import asyncio
 from pathlib import Path
@@ -67,26 +67,28 @@ class DeviceSecurityManager:
                 logger.error(f"Failed to parse approved_devices.json: {e}")
                 self.data_store = {"master_device_id": "sanket_s24_primary_master", "devices": {}, "pending_pairings": {}}
 
-    def _save_devices(self):
-        """Persist device registry to disk atomically."""
-        try:
-            temp_file = self.devices_file.with_suffix(".tmp")
-            with open(temp_file, "w", encoding="utf-8") as f:
-                json.dump(self.data_store, f, indent=2, ensure_ascii=False)
+    async def _save_devices(self):
+        """Persist device registry to disk atomically and safely."""
+        async with self._lock:
             try:
-                temp_file.replace(self.devices_file)
-            except OSError:
-                with open(self.devices_file, "w", encoding="utf-8") as f:
-                    json.dump(self.data_store, f, indent=2, ensure_ascii=False)
-                if temp_file.exists():
+                def _write():
+                    temp_file = self.devices_file.with_suffix(".tmp")
+                    with open(temp_file, "w", encoding="utf-8") as f:
+                        json.dump(self.data_store, f, indent=2, ensure_ascii=False)
                     try:
-                        temp_file.unlink()
-                    except Exception:
-                        pass
-        except Exception as e:
-            logger.error(f"Failed to save approved_devices.json: {e}")
+                        temp_file.replace(self.devices_file)
+                    except OSError:
+                        with open(self.devices_file, "w", encoding="utf-8") as f:
+                            json.dump(self.data_store, f, indent=2, ensure_ascii=False)
+                        if temp_file.exists():
+                            try: temp_file.unlink()
+                            except Exception: pass
+                
+                await asyncio.to_thread(_write)
+            except Exception as e:
+                logger.error(f"Failed to save approved_devices.json: {e}")
 
-    def validate_device(self, device_id: str) -> Tuple[bool, str]:
+    async def validate_device(self, device_id: str) -> Tuple[bool, str]:
         """
         Validate whether a device ID is approved and return its role.
         Returns: (is_approved: bool, role: str) -> ('MASTER', 'GUEST', or 'UNAUTHORIZED')
@@ -104,18 +106,18 @@ class DeviceSecurityManager:
         if device_id_clean in devices:
             dev_info = devices[device_id_clean]
             dev_info["last_seen"] = datetime.now().isoformat()
-            self._save_devices()
+            await self._save_devices()
             role = dev_info.get("role", "GUEST").upper()
             return True, role
 
         return False, "UNAUTHORIZED"
 
-    def is_master_device(self, device_id: str) -> bool:
+    async def is_master_device(self, device_id: str) -> bool:
         """Check if device has MASTER administrative privileges."""
-        is_approved, role = self.validate_device(device_id)
+        is_approved, role = await self.validate_device(device_id)
         return is_approved and role == "MASTER"
 
-    def create_pairing_request(self, device_id: str, device_name: str = "") -> str:
+    async def create_pairing_request(self, device_id: str, device_name: str = "") -> str:
         """
         Generate a 4-digit temporary PIN for a new unapproved device.
         """
@@ -129,7 +131,7 @@ class DeviceSecurityManager:
 
         # Generate unique 4-digit PIN
         while True:
-            pin = f"{random.randint(1000, 9999)}"
+            pin = f"{secrets.randbelow(9000) + 1000}"
             if pin not in pending:
                 break
 
@@ -138,11 +140,11 @@ class DeviceSecurityManager:
             "device_name": device_name or f"Device {device_id_clean[:6]}",
             "requested_at": datetime.now().isoformat()
         }
-        self._save_devices()
+        await self._save_devices()
         logger.info(f"🔑 Created pairing PIN {pin} for device '{device_id_clean}'")
         return pin
 
-    def approve_pairing_pin(self, pin: str, assigned_role: str = "GUEST") -> Tuple[bool, str]:
+    async def approve_pairing_pin(self, pin: str, assigned_role: str = "GUEST") -> Tuple[bool, str]:
         """
         Approve a pending device pairing PIN and add it to approved_devices.json.
         """
@@ -164,11 +166,11 @@ class DeviceSecurityManager:
             "approved_at": datetime.now().isoformat(),
             "last_seen": datetime.now().isoformat()
         }
-        self._save_devices()
+        await self._save_devices()
         logger.info(f"✅ Device '{device_name}' ({device_id}) approved as {role} via PIN {pin_clean}")
         return True, f"Device '{device_name}' approved successfully as {role}!"
 
-    def revoke_device(self, device_id: str) -> Tuple[bool, str]:
+    async def revoke_device(self, device_id: str) -> Tuple[bool, str]:
         """Revoke device access immediately."""
         device_id_clean = str(device_id).strip()
         devices = self.data_store.get("devices", {})
@@ -180,11 +182,11 @@ class DeviceSecurityManager:
             return False, "Cannot revoke the Primary Master Device."
 
         dev_name = devices.pop(device_id_clean).get("device_name", device_id_clean)
-        self._save_devices()
+        await self._save_devices()
         logger.info(f"🚫 Revoked access for device '{dev_name}' ({device_id_clean})")
         return True, f"Access revoked for '{dev_name}'."
 
-    def elevate_device_to_master(self, device_id: str) -> Tuple[bool, str]:
+    async def elevate_device_to_master(self, device_id: str) -> Tuple[bool, str]:
         """Elevate a paired device role from GUEST to MASTER via secret passphrase."""
         device_id_clean = str(device_id).strip()
         devices = self.data_store.get("devices", {})
@@ -199,7 +201,7 @@ class DeviceSecurityManager:
             devices[device_id_clean]["role"] = "MASTER"
             devices[device_id_clean]["last_seen"] = datetime.now().isoformat()
 
-        self._save_devices()
+        await self._save_devices()
         logger.info(f"👑 Device '{device_id_clean}' elevated to MASTER role via Secret Passphrase!")
         return True, "Secret passphrase verified! Admin privileges granted to this device."
 
@@ -211,12 +213,12 @@ class DeviceSecurityManager:
             "pending_pairings": self.data_store.get("pending_pairings", {})
         }
 
-    def execute_emergency_killswitch(self, sender_device_id: str) -> Tuple[bool, str]:
+    async def execute_emergency_killswitch(self, sender_device_id: str) -> Tuple[bool, str]:
         """
         Execute Emergency Process Termination on the PC Backend.
         Requires MASTER role.
         """
-        is_master = self.is_master_device(sender_device_id)
+        is_master = await self.is_master_device(sender_device_id)
         if not is_master:
             logger.warning(f"🚨 UNAUTHORIZED KILL-SWITCH ATTEMPT blocked from device '{sender_device_id}'!")
             return False, "Permission Denied: Emergency Shutdown can only be triggered by the Master Device (Sanket's Phone)."

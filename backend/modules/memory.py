@@ -202,6 +202,10 @@ class MemoryManager:
         
         return "\n".join(context_parts)
     
+    def get_recent_messages(self, limit: int = 5) -> List[Dict]:
+        """Return raw messages for subagents."""
+        return self.memory.get("messages", [])[-limit:]
+    
     async def clear_memory(self) -> bool:
         """Reset conversation history (keep user facts and profile)."""
         try:

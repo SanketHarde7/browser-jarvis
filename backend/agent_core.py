@@ -214,11 +214,19 @@ class MaxAgent:
         self.intent_engine = get_intent_engine(config)
         self.listening_manager = ListeningManager()
         
+        # New Router and Chat Agent
+        from modules.master_router import MasterRouter
+        from modules.subagents.chat_agent import ChatAgent
+        self.master_router = MasterRouter(config)
+        self.chat_agent = ChatAgent(config)
+        
         # 👻 GHOST MODE INITIALIZED CORRECTLY (NOT COMMENTED OUT)
         self.ghost_mode = False
         self.typing_mode = False
         
         self.current_stream_task_id: str = ""
+        self.last_assistant_response: str = ""
+        self.skills.agent_ref = self
 
         
         # Real-time reminder scheduler
@@ -323,7 +331,7 @@ class MaxAgent:
                 except Exception:
                     pass
 
-    async def process_text_input(self, text: str, use_tts: bool = True, input_source: str = "unknown") -> Dict[str, Any]:
+    async def process_text_input(self, text: str, use_tts: bool = True, input_source: str = "unknown", sender_device: str = "") -> Dict[str, Any]:
         """
         Main entry point for user text queries.
         Refactored into a 5-stage pipeline for better error isolation and maintainability.
@@ -339,7 +347,7 @@ class MaxAgent:
             
         try:
             # ── STAGE 1: Security & Admin Overrides ──
-            result = await self._pipeline_stage_1_security_and_overrides(text, use_tts)
+            result = await self._pipeline_stage_1_security_and_overrides(text, use_tts, sender_device)
             
             # ── STAGE 2: Device Switching ──
             if not result:
@@ -384,39 +392,40 @@ class MaxAgent:
     # PIPELINE STAGE HELPER METHODS
     # ══════════════════════════════════════════════════════════
 
-    async def _pipeline_stage_1_security_and_overrides(self, text: str, use_tts: bool) -> Optional[Dict[str, Any]]:
+    async def _pipeline_stage_1_security_and_overrides(self, text: str, use_tts: bool, sender_device: str) -> Optional[Dict[str, Any]]:
         text_lower = text.lower().strip()
         admin_secret = os.getenv("MAX_ADMIN_ELEVATION_PASSPHRASE", "").strip()
         
+        # Determine actual device ID for security checks (fallback to target if missing)
+        actual_device = sender_device if sender_device else get_active_device()
+        
         if admin_secret and len(admin_secret) >= 8:
-            import hmac
-            def _safe_digest_check(val1: str, val2: str) -> bool:
-                try: return hmac.compare_digest(val1.encode('utf-8'), val2.encode('utf-8'))
-                except Exception: return False
-            words = text_lower.split()
-            if any(_safe_digest_check(w, admin_secret.lower()) for w in words) or _safe_digest_check(text_lower, admin_secret.lower()):
+            if admin_secret.lower() in text_lower:
                 _get_sec = registry.get_function("modules.device_security", "get_security_manager")
                 sec = _get_sec(self.config) if _get_sec else None
                 if not sec: return {"response": "Security module unavailable.", "tts_path": "", "skill_used": "admin_elevation", "intent": "admin_elevation", "status": "degraded"}
-                success, msg = sec.elevate_device_to_master(get_active_device())
+                success, msg = await sec.elevate_device_to_master(actual_device)
                 return {"response": msg, "tts_path": await generate_tts(msg) if use_tts else "", "skill_used": "admin_elevation", "intent": "admin_elevation"}
 
         if any(p in text_lower for p in ["emergency shutdown", "kill max backend", "shutdown max backend", "kill backend", "emergency killswitch"]):
             _get_sec2 = registry.get_function("modules.device_security", "get_security_manager")
             sec = _get_sec2(self.config) if _get_sec2 else None
             if not sec: return {"response": "Security module unavailable for emergency action.", "tts_path": "", "skill_used": "emergency_killswitch", "intent": "emergency_killswitch", "status": "degraded"}
-            success, msg = sec.execute_emergency_killswitch(get_active_device())
+            success, msg = await sec.execute_emergency_killswitch(actual_device)
             return {"response": msg, "tts_path": await generate_tts(msg) if use_tts and success else "", "skill_used": "emergency_killswitch", "intent": "emergency_killswitch"}
 
         _get_sec3 = registry.get_function("modules.device_security", "get_security_manager")
         sec = _get_sec3(self.config) if _get_sec3 else None
-        is_approved, role = sec.validate_device(get_active_device()) if sec else (True, "MASTER")
+        
+        # FAIL-SAFE: If security module fails to load, default to GUEST instead of MASTER
+        is_approved, role = await sec.validate_device(actual_device) if sec else (True, "GUEST")
+        
         if role == "GUEST":
             restricted_keywords = [
                 r"\bshutdown\b", r"\bquit\s+max\b", r"\bdelete\s+file\b", r"\brun\s+code\b", r"\bwrite\s+code\b", 
                 r"\bapprove\s+device\b", r"\brevoke\s+device\b", r"\bsystem_shutdown\b",
                 r"\bclose\s+app\b", r"\bclose_app\b", r"\bclose\s+window\b", r"\bclose_window\b", 
-                r"\balt\+f4\b", r"\balt\s+f4\b", r"\bkey_chord\b", r"\bkill\b", r"\bformat\b"
+                r"\balt\+f4\b", r"\balt\s+f4\b", r"\bkey_chord\b"
             ]
             if any(re.search(pat, text_lower) for pat in restricted_keywords):
                 msg = "Permission Denied: System control and app closing actions can only be executed by the Master Device (Sanket's Phone)."
@@ -438,11 +447,12 @@ class MaxAgent:
             await self._send_event_via_websocket({"event": "SWITCH_ACTIVE", "device": "phone"})
             await self._send_event_to_device("phone", {"event": "start_continuous_listening"})
             msg = random.choice(PHONE_SWITCH_ACKS)
+            await self._send_event_to_device("phone", {"event": "response_text", "text": msg})
+            
             tts_path = await generate_tts(msg) if use_tts else ""
             if tts_path and os.path.exists(tts_path):
                 try:
                     with open(tts_path, "rb") as f: audio_b64 = base64.b64encode(f.read()).decode("utf-8")
-                    await self._send_event_to_device("phone", {"event": "response_text", "text": msg})
                     await self._send_event_to_device("phone", {"event": "audio_response", "audio": audio_b64})
                 except Exception as e: logger.error(f"Error sending audio to phone: {e}")
                 finally:
@@ -460,11 +470,12 @@ class MaxAgent:
             await self._send_event_via_websocket({"event": "SWITCH_ACTIVE", "device": "laptop"})
             await self._send_event_to_device("laptop", {"event": "start_continuous_listening"})
             msg = random.choice(LAPTOP_SWITCH_ACKS)
+            await self._send_event_to_device("laptop", {"event": "response_text", "text": msg})
+            
             tts_path = await generate_tts(msg) if use_tts else ""
             if tts_path and os.path.exists(tts_path):
                 try:
                     with open(tts_path, "rb") as f: audio_b64 = base64.b64encode(f.read()).decode("utf-8")
-                    await self._send_event_to_device("laptop", {"event": "response_text", "text": msg})
                     await self._send_event_to_device("laptop", {"event": "audio_response", "audio": audio_b64})
                 except Exception as e: logger.error(f"Error sending audio to laptop: {e}")
                 finally:
@@ -589,8 +600,45 @@ class MaxAgent:
         return combined_context
 
     async def _pipeline_stage_5_llm_and_skills(self, text: str, combined_context: str, use_tts: bool):
-        print(" [TRACKER: 7] Checking Intent...")
-        intent = await self.intent_engine.classify(text)
+        print(" [TRACKER: 7] Checking Router...")
+        
+        # --- MASTER ROUTER INTERCEPTION ---
+        # Fetch past messages excluding the current query added in Stage 4
+        all_messages = self.memory.get_recent_messages(limit=6)
+        past_context = all_messages[:-1] if len(all_messages) > 1 else []
+        
+        assigned_agent = await self.master_router.route(text, past_context)
+        
+        if assigned_agent == "chat_agent":
+            print(" [ROUTER] Delegating to ChatAgent...")
+            try:
+                chat_result = await self.chat_agent.process(text, past_context)
+                raw_response = chat_result["response"]
+                filtered_response = self.gatekeeper.filter(raw_response)
+                self.last_assistant_response = filtered_response
+                
+                # Generate TTS and save to memory
+                tts_path = ""
+                if use_tts and filtered_response:
+                    chunks = self.gatekeeper.chunk_for_tts(filtered_response)
+                    if chunks:
+                        try:
+                            tts_path = await asyncio.wait_for(generate_tts(chunks[0]), timeout=15.0)
+                            if len(chunks) > 1:
+                                asyncio.create_task(self._stream_remaining_tts(chunks[1:], self.current_stream_task_id))
+                        except Exception as e:
+                            print(f" [TRACKER: ERROR] TTS chunk 1 Crashed: {e}")
+                
+                await self.memory.add_message("assistant", filtered_response)
+                await self.memory.save_memory()
+                return {"response": filtered_response, "tts_path": tts_path, "skill_used": None, "intent": "general_chat"}
+            except Exception as e:
+                logger.error(f"ChatAgent failed: {e}. Falling back to legacy_engine.")
+                # Fallback to legacy below
+        
+        print(" [ROUTER] Delegating to Legacy Engine...")
+        
+        intent = await self.intent_engine.classify(text, combined_context)
         allow_skills = intent.should_execute_skill
 
         # 🤖 AGENT LOOP
@@ -656,21 +704,10 @@ class MaxAgent:
 
         print(f"\n[DEBUG AGENT_CORE] Candidate Skills Block:\n{candidate_skills_block}\n")
         
-        # --- RAG OVERRIDE (Bypass LLM for high confidence) ---
-        skill_tag = None
-        if allow_skills and candidates and candidates[0].score >= 1.0:
-            top_skill = candidates[0]
-            print(f"[TRACKER: RAG OVERRIDE] High-confidence skill: {top_skill.name} (score={top_skill.score:.2f})")
-            skill_tag = top_skill.example
-            # Get response from LLM but DO NOT let it select a skill
-            result = await get_response(text, combined_context, allow_skills=False, candidate_skills_block="", learning_context=learning_context)
-            llm_response = result["response"]
-        else:
-            # Let LLM decide
-            result = await get_response(text, combined_context, allow_skills=allow_skills, candidate_skills_block=candidate_skills_block, learning_context=learning_context)
-            llm_response = result["response"]
-            if allow_skills:
-                skill_tag = result.get("skill")
+        # --- LLM DECISION (RAG strictly provides candidate skills, LLM retains full reasoning & parameter control) ---
+        result = await get_response(text, combined_context, allow_skills=allow_skills, candidate_skills_block=candidate_skills_block, learning_context=learning_context)
+        llm_response = result["response"]
+        skill_tag = result.get("skill") if allow_skills else None
         # -----------------------------------------------------
         
         print(f"[DEBUG AGENT_CORE] LLM Generated Skill Tag: {skill_tag}")
@@ -743,6 +780,7 @@ class MaxAgent:
             await self.memory.update_personality(len(final_response), "")
 
         filtered = self.gatekeeper.filter(final_response)
+        self.last_assistant_response = filtered
         
         try:
             _get_forge = registry.get_function("modules.skill_forge", "get_skill_forge")
@@ -767,6 +805,9 @@ class MaxAgent:
                         asyncio.create_task(self._stream_remaining_tts(chunks[1:], self.current_stream_task_id))
                 except Exception as e:
                     print(f" [TRACKER: ERROR] TTS chunk 1 Crashed: {e}")
+                    try:
+                        await self._send_event_via_websocket({"event": "text_response", "text": filtered})
+                    except Exception: pass
 
         if ack_task and not ack_task.done():
             try: await asyncio.wait_for(ack_task, timeout=2.0)

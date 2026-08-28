@@ -129,8 +129,12 @@ CRITICAL DECISION RULES (in order of priority):
 1. If the message contains capability-check words ("can you", "are you able", "kya tum kar sakte", "tell me if you can") → CAPABILITY_QUESTION, should_execute_skill=false
 2. If the message contains negation ("don't", "do not", "never", "mat") about an action → NEGATIVE_COMMAND, should_execute_skill=false
 3. If it's a greeting, casual chat, identity question → CONVERSATION, should_execute_skill=false
-4. If user is directly asking for an action now → COMMAND, should_execute_skill=true
-5. Otherwise → INFORMATION_QUESTION, should_execute_skill=true (may need search)
+4. If the message is a direct response, continuation, or relates to a game/topic in the Recent Context (even if it's random Hindi text or lyrics) → CONVERSATION, should_execute_skill=false
+5. If user is directly asking for an action now → COMMAND, should_execute_skill=true
+6. Otherwise → INFORMATION_QUESTION, should_execute_skill=true (may need search)
+
+Recent Context:
+{context}
 
 User message: "{text}"
 
@@ -169,6 +173,20 @@ _CONVERSATION_PATTERNS = re.compile(
     re.IGNORECASE
 )
 
+_GREETING_WITH_NAME = re.compile(
+    r"^(?:hey|hello|hi|good\s+morning|good\s+night|good\s+evening|"
+    r"good\s+afternoon|yo|namaste|howdy|hola)[\s,]+"
+    r"(?:max|mex|maps|macs)[\s!?.,]*$",
+    re.IGNORECASE
+)
+
+_SUGGESTION_PATTERNS = re.compile(
+    r'\b(suggest|recommend|advise|best platform|best website|best app|'
+    r'which one|which platform|what is the best|kya suggest|konsa best|'
+    r'kya use karu|which one should|best way to|best tool)\b',
+    re.IGNORECASE
+)
+
 _ACTION_VERBS = {"open", "khol", "kholo", "play", "launch", "start", "run", "search", "record", "create", "set", "delete", "send"}
 
 def _fast_classify(text: str) -> Optional[Intent]:
@@ -177,9 +195,34 @@ def _fast_classify(text: str) -> Optional[Intent]:
     Dynamically differentiates capability questions from explicit action requests.
     """
     t = text.strip()
-    # Strip wake word for cleaner pattern matching
-    t_clean = re.sub(r'^(hey max|hello max|hi max|ok max|max)[\s,]*', '', t, flags=re.IGNORECASE).strip()
+
+    # ── Greeting with assistant name (highest priority) ──
+    # Catches: "Hello, Max.", "Hey Max!", "Good morning Max", etc.
+    if _GREETING_WITH_NAME.match(t):
+        return Intent(
+            type=IntentType.CONVERSATION,
+            should_execute_skill=False,
+            confidence=0.99,
+            reason="greeting with assistant name"
+        )
+
+    # Strip wake word for cleaner pattern matching (handles comma: "Hello, Max, open chrome")
+    t_clean = re.sub(r'^(?:hey|hello|hi|ok|okay)[\s,]+max\b[\s,.!?]*', '', t, flags=re.IGNORECASE).strip()
+    if t_clean == t.strip():
+        # Didn't match greeting+max prefix, try standalone "max" prefix
+        t_clean = re.sub(r'^max[\s,]+', '', t, flags=re.IGNORECASE).strip()
+    if not t_clean:
+        t_clean = t.strip()
     words = set(re.findall(r'\b\w+\b', t_clean.lower()))
+
+    # Recommendation / advice check (no explicit action verbs)
+    if _SUGGESTION_PATTERNS.search(t_clean) and not words.intersection(_ACTION_VERBS):
+        return Intent(
+            type=IntentType.CONVERSATION,
+            should_execute_skill=False,
+            confidence=0.97,
+            reason="pure recommendation/suggestion query"
+        )
 
     # Capability check:
     # "can you play youtube videos?" -> CAPABILITY_QUESTION
@@ -204,6 +247,16 @@ def _fast_classify(text: str) -> Optional[Intent]:
         )
 
     if _NEGATIVE_PATTERNS.search(t_clean):
+        # Allow cancel skills for system actions (shutdown/restart/lock)
+        # "don't shutdown" / "cancel shutdown" → still needs skill execution for cancel_shutdown
+        _CANCELLABLE_ACTION_WORDS = {"shutdown", "shut", "restart", "reboot", "lock", "power"}
+        if words.intersection(_CANCELLABLE_ACTION_WORDS):
+            return Intent(
+                type=IntentType.COMMAND,
+                should_execute_skill=True,
+                confidence=0.97,
+                reason="negation with cancellable system action — route to cancel skill"
+            )
         return Intent(
             type=IntentType.NEGATIVE_COMMAND,
             should_execute_skill=False,
@@ -240,7 +293,7 @@ class IntentEngine:
         self._cache: Dict[str, Intent] = {}
         self._max_cache_size = 500
 
-    async def classify(self, text: str) -> Intent:
+    async def classify(self, text: str, context: str = "") -> Intent:
         """
         Main entry point. Returns Intent for the given user text.
         Never raises — falls back to safe defaults on failure.
@@ -274,7 +327,7 @@ class IntentEngine:
 
         # [PREVIOUS LOGIC PRESERVED]
         # try:
-        #     intent = await asyncio.wait_for(self._llm_classify(text), timeout=10.0)
+        #     intent = await asyncio.wait_for(self._llm_classify(text, context), timeout=10.0)
         # except asyncio.TimeoutError:
         #     intent = self._default_intent("timeout")
         # except Exception as e:
@@ -282,10 +335,12 @@ class IntentEngine:
         # self._cache_put(cache_key, intent)
         # return intent
 
-    async def _llm_classify(self, text: str) -> Intent:
+    async def _llm_classify(self, text: str, context: str) -> Intent:
         from groq import AsyncGroq
-
-        prompt = _PROMPT.replace("{text}", text.strip())
+        
+        # Limit context size to avoid massive token overhead per intent call
+        short_context = context[-1500:] if len(context) > 1500 else context
+        prompt = _PROMPT.replace("{text}", text.strip()).replace("{context}", short_context or "No recent context.")
 
         async def call():
             key = await key_pool.lease_key()

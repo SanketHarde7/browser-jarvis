@@ -61,9 +61,14 @@ def is_complex_goal(text: str) -> bool:
     t = (text or "").strip()
     if len(t.split()) < 5:
         return False
-    if _SEQUENCE_RE.search(t):
-        return True
+        
     distinct_verbs = {m.lower() for m in _ACTION_VERB_RE.findall(t)}
+    
+    if _SEQUENCE_RE.search(t):
+        # A sequence word ("after this") alone is not enough; could just be conversation.
+        # Require at least 2 distinct action verbs to consider it a complex goal.
+        return len(distinct_verbs) >= 2
+        
     return len(distinct_verbs) >= 3
 
 

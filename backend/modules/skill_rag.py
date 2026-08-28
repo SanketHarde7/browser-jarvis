@@ -28,6 +28,26 @@ from typing import List, Dict, Optional, Tuple
 
 logger = logging.getLogger("MAX.SKILL_RAG")
 
+# ═══════════════════════════════════════════════════
+# STOP WORDS — filtered from query word-matching to
+# prevent false positives (e.g., "max" triggering quit_max)
+# NOTE: These ONLY affect word-overlap scoring.
+#       Exact phrase matching is NOT affected.
+# ═══════════════════════════════════════════════════
+_QUERY_STOP_WORDS = frozenset({
+    # Assistant name (STT variations)
+    "max", "mex", "maps", "macs",
+    # Wake words / greetings (should not trigger skills)
+    "hey", "hello", "hi", "ok", "okay",
+    # Common filler/function words
+    "please", "can", "you", "the", "a", "an", "is", "are", "do", "does",
+    "i", "me", "my", "we", "us", "to", "for", "it", "its", "in", "on",
+    "at", "and", "or", "but", "with", "from", "this", "that", "there",
+    "just", "also", "very", "really", "so", "if", "be", "was", "were",
+    "been", "being", "have", "has", "had", "will", "would", "could",
+    "should", "shall", "not", "no", "yes", "of", "by", "about",
+})
+
 
 # ═══════════════════════════════════════════════════
 # SKILL CANDIDATE DATACLASS
@@ -41,6 +61,7 @@ class SkillCandidate:
     example: str
     score: float = 0.0
     category: str = ""
+    has_exact_match: bool = False
 
 
 # ═══════════════════════════════════════════════════
@@ -403,22 +424,68 @@ SKILL_METADATA: Dict[str, Dict] = {
         "cat": "system"
     },
     "lock_pc": {
-        "triggers": ["lock", "lock pc", "lock computer", "pc lock karo", "lock screen"],
-        "desc": "Lock the computer",
-        "example": "[SKILL:lock_pc]",
+        "triggers": ["lock", "lock pc", "lock computer", "pc lock karo", "lock screen",
+                      "lock in", "lock after", "lock my pc"],
+        "desc": "Lock the computer. Pass delay in SECONDS (e.g., 120 for 2 min). 0 = immediate.",
+        "example": "[SKILL:lock_pc:delay_in_seconds]",
         "cat": "system"
     },
     "system_shutdown": {
         "triggers": ["shutdown", "shut down", "power off", "band karo pc",
-                      "computer band karo"],
-        "desc": "Shut down the computer",
-        "example": "[SKILL:system_shutdown]",
+                      "computer band karo", "shutdown in", "shutdown after",
+                      "shut down in", "pc band kar dena"],
+        "desc": "Shut down the computer. Pass delay in SECONDS (e.g., 300 for 5 min). 0 = immediate.",
+        "example": "[SKILL:system_shutdown:delay_in_seconds]",
         "cat": "system"
     },
     "system_restart": {
-        "triggers": ["restart", "reboot", "restart pc", "computer restart"],
-        "desc": "Restart the computer",
-        "example": "[SKILL:system_restart]",
+        "triggers": ["restart", "reboot", "restart pc", "computer restart",
+                      "restart in", "restart after", "reboot in"],
+        "desc": "Restart the computer. Pass delay in SECONDS (e.g., 600 for 10 min). 0 = immediate.",
+        "example": "[SKILL:system_restart:delay_in_seconds]",
+        "cat": "system"
+    },
+    "cancel_shutdown": {
+        "triggers": ["cancel shutdown", "don't shutdown", "dont shutdown",
+                      "stop shutdown", "shutdown cancel", "shutdown rokho",
+                      "mat shutdown karo", "shutdown band karo",
+                      "don't shut down", "dont shut down", "abort shutdown",
+                      "shutdown mat karo", "don't turn off", "pc mat band karo",
+                      "stop shut down", "don't shutdown my pc",
+                      "dont shutdown my pc", "don't power off"],
+        "desc": "Cancel a scheduled PC shutdown",
+        "example": "[SKILL:cancel_shutdown]",
+        "cat": "system"
+    },
+    "cancel_restart": {
+        "triggers": ["cancel restart", "don't restart", "dont restart",
+                      "stop restart", "restart cancel", "restart rokho",
+                      "mat restart karo", "abort restart", "reboot cancel",
+                      "don't reboot", "dont reboot", "restart mat karo",
+                      "stop reboot", "don't restart my pc",
+                      "dont restart my pc"],
+        "desc": "Cancel a scheduled PC restart",
+        "example": "[SKILL:cancel_restart]",
+        "cat": "system"
+    },
+    "cancel_lock": {
+        "triggers": ["cancel lock", "don't lock", "dont lock",
+                      "stop lock", "lock cancel", "lock rokho",
+                      "mat lock karo", "abort lock", "lock mat karo",
+                      "don't lock my pc", "dont lock my pc",
+                      "pc mat lock karo", "stop lock my pc",
+                      "don't lock pc", "dont lock pc"],
+        "desc": "Cancel a scheduled PC lock",
+        "example": "[SKILL:cancel_lock]",
+        "cat": "system"
+    },
+    "repeat_last": {
+        "triggers": ["speak again", "say again", "repeat", "what did you say",
+                      "voice didn't come", "phir se bol", "repeat that", "voice not clear",
+                      "what you said earlier", "what did you say earlier", "speak that again",
+                      "repeat response", "bolna phir se"],
+        "desc": "Repeat the last response or statement spoken by MAX",
+        "example": "[SKILL:repeat_last]",
         "cat": "system"
     },
     "wifi_toggle": {
@@ -560,6 +627,12 @@ SKILL_METADATA: Dict[str, Dict] = {
                       "whatsapp me", "send text"],
         "desc": "Send a WhatsApp message to a contact",
         "example": "[SKILL:whatsapp_message:me:hello]",
+        "cat": "communication"
+    },
+    "whatsapp_send_clipboard": {
+        "triggers": ["send image", "send clipboard", "clipboard image", "copied image", "same chat", "clipboard to whatsapp"],
+        "desc": "Send current clipboard image or content to a contact on WhatsApp",
+        "example": "[SKILL:whatsapp_send_clipboard:Aditya]",
         "cat": "communication"
     },
     "whatsapp_screenshot": {
@@ -814,7 +887,7 @@ class SkillRAGMatcher:
         GUARANTEED to return at least 1 candidate (Layer 3 safety net).
         """
         query_lower = query.lower().strip()
-        query_words = set(re.findall(r'\b\w+\b', query_lower))
+        query_words = set(re.findall(r'\b\w+\b', query_lower)) - _QUERY_STOP_WORDS
 
         # ── Check overrides from learning journal ──
         for pattern, skill_name in self._skill_overrides.items():
@@ -830,25 +903,58 @@ class SkillRAGMatcher:
 
         # ── Layer 1: Keyword/Regex Match ──
         scores: Dict[str, float] = {}
+        exact_match_flags: Dict[str, bool] = {}
+
+        # Negation detection: "don't shutdown", "stop restart", "cancel lock" etc.
+        _NEGATION_WORDS = {"don't", "dont", "cancel", "stop", "abort", "mat", "rokho", "band"}
+        query_has_negation = bool(_NEGATION_WORDS & set(re.findall(r"[\w']+", query_lower)))
+        # Map of action skills to their cancel counterparts
+        _ACTION_TO_CANCEL = {
+            "system_shutdown": "cancel_shutdown",
+            "system_restart":  "cancel_restart",
+            "lock_pc":         "cancel_lock",
+        }
+        _CANCEL_SKILLS = set(_ACTION_TO_CANCEL.values())
+
         for skill_name, meta in SKILL_METADATA.items():
-            score = 0.0
+            exact_score = 0.0
+            best_partial = 0.0
+            has_exact = False
             triggers = meta.get("triggers", [])
             for trigger in triggers:
                 trigger_lower = trigger.lower()
-                trigger_words = set(trigger_lower.split())
-                # Exact phrase match (highest weight)
+                trigger_words = set(trigger_lower.split()) - _QUERY_STOP_WORDS
+                # Exact phrase match (highest weight — accumulates across triggers)
+                # Specificity bonus: longer trigger matches score higher
                 if trigger_lower in query_lower:
-                    score += 1.0
-                # Word overlap match
-                elif trigger_words & query_words:
+                    specificity_bonus = len(trigger_lower.split()) * 0.1
+                    exact_score += 1.0 + specificity_bonus
+                    has_exact = True
+                # Word overlap — only BEST partial counts (prevents stacking)
+                elif trigger_words and query_words and (trigger_words & query_words):
                     overlap = len(trigger_words & query_words) / len(trigger_words)
-                    score += 0.5 * overlap
+                    best_partial = max(best_partial, 0.5 * overlap)
 
+            score = exact_score + best_partial
             # Add learning boost
             score += self._usage_boosts.get(skill_name, 0.0)
 
             if score > 0:
                 scores[skill_name] = score
+                exact_match_flags[skill_name] = has_exact
+
+        # ── Negation-aware scoring adjustment ──
+        # When query has negation words: boost cancel skills, penalize action skills
+        if query_has_negation:
+            for action_skill, cancel_skill in _ACTION_TO_CANCEL.items():
+                if action_skill in scores and cancel_skill in scores:
+                    # Penalize the action skill — user said "don't" do it
+                    scores[action_skill] *= 0.3
+                    # Boost the cancel skill
+                    scores[cancel_skill] *= 1.5
+                elif action_skill in scores and cancel_skill not in scores:
+                    # Action skill matched but cancel didn't — still penalize action
+                    scores[action_skill] *= 0.5
 
         # ── Category Boost: if any skill in a category matched, boost siblings ──
         matched_categories = set()
@@ -873,7 +979,8 @@ class SkillRAGMatcher:
                     description=meta["desc"],
                     example=meta["example"],
                     score=score,
-                    category=meta["cat"]
+                    category=meta["cat"],
+                    has_exact_match=exact_match_flags.get(skill_name, False)
                 ))
             logger.info(f"SkillRAG L1: {len(candidates)} candidates for '{query[:50]}' → {[c.name for c in candidates]}")
             return candidates
